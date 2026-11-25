@@ -7,11 +7,16 @@ token.txt (junto a este archivo). En arranques posteriores lo lee solo.
 Además se actualiza solo: descarga bot.py desde GitHub, y si hay una
 versión nueva la escribe y se reinicia.
 
-Todos los comandos usan APIs públicas gratuitas que no piden key
+Casi todos los comandos usan APIs públicas gratuitas que no piden key
 (Open-Meteo, CoinGecko, exchangerate-api, ip-api, Google DNS, RDAP,
 Wikipedia, MyMemory, USGS, PokeAPI, Dog CEO, Cataas, JokeAPI, GitHub,
 TinyURL, api.qrserver.com) o hacen scraping ligero de RSS y YouTube.
-No se usa ninguna credencial de terceros.
+
+Unos pocos aprovechan claves gratuitas de APIs: el diccionario KEYS de
+abajo ya trae las claves públicas de demostración (NASA DEMO_KEY, Twelve
+Data "demo", TheMealDB/TheCocktailDB "1"), así que funcionan sin que
+hagas nada. Para /gif y /pelicula solo hay que pegar una clave gratis
+(ver /claves); el bot sigue funcionando igual sin ellas.
 
 Uso:
     pip install "python-telegram-bot>=21"
@@ -30,10 +35,11 @@ import random
 import re
 import sys
 import time
-from datetime import datetime, timezone
+import unicodedata
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, unquote_plus, urlencode
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
@@ -46,8 +52,33 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "2.0"
+VERSION = "3.0"
 START_TIME = time.time()
+
+# --------------------------------------------------------------------------
+# Claves de APIs. Todas son gratis y opcionales: las que vienen puestas son
+# claves públicas de demostración y el bot funciona sin tocar nada. Si quieres
+# más cuota o más símbolos, crea tu clave gratis y pégala aquí entre comillas.
+# --------------------------------------------------------------------------
+KEYS: dict[str, str] = {
+    "nasa": "DEMO_KEY",  # api.nasa.gov (DEMO_KEY: 30 peticiones/hora)
+    "twelvedata": "demo",  # twelvedata.com ("demo": AAPL, BTC/USD, EUR/USD)
+    "giphy": "",  # developers.giphy.com (necesaria para /gif)
+    "omdb": "",  # omdbapi.com (necesaria para /pelicula)
+}
+
+# (clave, nombre, dónde conseguirla, nota)
+KEY_INFO: list[tuple[str, str, str, str]] = [
+    ("nasa", "NASA", "https://api.nasa.gov", "DEMO_KEY ya funciona; la clave gratis sube el límite"),
+    (
+        "twelvedata",
+        "Twelve Data (acciones y divisas)",
+        "https://twelvedata.com/pricing",
+        "con \"demo\" solo AAPL, BTC/USD y EUR/USD",
+    ),
+    ("giphy", "Giphy (GIFs)", "https://developers.giphy.com/dashboard/", "gratis; necesaria para /gif"),
+    ("omdb", "OMDb (películas)", "https://www.omdbapi.com/apikey.aspx", "gratis por correo; necesaria para /pelicula"),
+]
 
 # Auto-actualización desde el repositorio original
 UPDATE_URL = "https://raw.githubusercontent.com/Andresv27728/Bot.python/main/bot.py"
@@ -88,6 +119,26 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("acortar", " <url>", "acorta una URL"),
     ("dado", " [caras]", "lanza un dado"),
     ("moneda", "", "lanza una moneda al aire"),
+    ("nasa", " [tema]", "foto del día o imágenes de la NASA"),
+    ("receta", " [plato]", "receta con ingredientes e instrucciones"),
+    ("trago", " [nombre]", "cóctel con ingredientes y preparación"),
+    ("serie", " <título>", "busca una serie de televisión"),
+    ("anime", " <título>", "busca un anime"),
+    ("libro", " <título>", "busca un libro en Open Library"),
+    ("aire", " <ciudad>", "calidad del aire de una ciudad"),
+    ("pais", " <nombre>", "datos de un país"),
+    ("stack", " <búsqueda>", "preguntas de Stack Overflow"),
+    ("radio", " <nombre>", "emisoras de radio en línea"),
+    ("mc", " <servidor>", "estado de un servidor de Minecraft"),
+    ("carta", " [cantidad]", "saca cartas de la baraja"),
+    ("trivia", "", "pregunta de trivia con opciones"),
+    ("wayback", " <url>", "copia antigua de una página en Internet Archive"),
+    ("publicar", " <texto>", "publica un texto largo en telegra.ph"),
+    ("sol", " <ciudad>", "amanecer y atardecer de una ciudad"),
+    ("accion", " <símbolo>", "precio de una acción o divisa (Twelve Data)"),
+    ("gif", " <búsqueda>", "busca un GIF (necesita clave de Giphy)"),
+    ("pelicula", " <título>", "busca una película (necesita clave de OMDb)"),
+    ("claves", "", "estado de las claves de APIs"),
     ("echo", " <texto>", "repito tu texto"),
 ]
 
@@ -193,6 +244,39 @@ async def http_text(url: str, params: dict | None = None) -> str:
     return raw.decode("utf-8", "replace")
 
 
+def _http_post(url: str, payload: dict) -> bytes:
+    body = json.dumps(payload).encode("utf-8")
+    request = Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "User-Agent": USER_AGENT,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    with urlopen(request, timeout=HTTP_TIMEOUT) as response:
+        return response.read()
+
+
+async def http_post_json(url: str, payload: dict) -> object:
+    raw = await asyncio.to_thread(_http_post, url, payload)
+    return json.loads(raw.decode("utf-8", "replace"))
+
+
+def fold(text: str) -> str:
+    """Minúsculas y sin tildes, para comparar nombres."""
+    decomposed = unicodedata.normalize("NFKD", text or "")
+    return decomposed.encode("ascii", "ignore").decode("ascii").lower().strip()
+
+
+def strip_html(text: str | None) -> str:
+    """Quita etiquetas HTML y espacios repetidos (sinpsosis de APIs)."""
+    clean = re.sub(r"<[^>]+>", " ", text or "")
+    return re.sub(r"\s+", " ", html.unescape(clean)).strip()
+
+
 def truncate(text: str, limit: int = 3900) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
@@ -221,7 +305,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         f"¡Hola, {name}! 👋\n"
         f"Soy tu bot de Telegram y tengo {len(COMMANDS)} comandos: clima, noticias, "
-        "Wikipedia, traducción, cripto, divisas, DNS, QR, YouTube y más.\n"
+        "Wikipedia, recetas, series, anime, NASA, cripto, divisas, DNS, QR y más.\n"
         "Escribe /help para verlos todos."
     )
 
@@ -360,7 +444,8 @@ def weather_label(code: int | float | None) -> str:
     return WMO_CODES.get(int(code or 0), f"código {code}")
 
 
-async def weather_report(city: str) -> str:
+async def geocode(city: str) -> dict:
+    """Busca una ciudad en Open-Meteo y devuelve el primer resultado."""
     geo = await http_json(
         "https://geocoding-api.open-meteo.com/v1/search",
         {"name": city, "count": 1, "language": "es", "format": "json"},
@@ -368,7 +453,11 @@ async def weather_report(city: str) -> str:
     results = (geo or {}).get("results") or []
     if not results:
         raise CommandError(f"No encontré la ciudad «{city}». Prueba con otro nombre.")
-    place = results[0]
+    return results[0]
+
+
+async def weather_report(city: str) -> str:
+    place = await geocode(city)
     latitude = place["latitude"]
     longitude = place["longitude"]
 
@@ -1016,6 +1105,789 @@ async def cmd_moneda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 # --------------------------------------------------------------------------
+# NASA (DEMO_KEY / images-api) y CDN de imágenes
+# --------------------------------------------------------------------------
+async def nasa_report(topic: str | None) -> tuple[str, str | None]:
+    """Devuelve (texto, imagen). Sin tema: foto astronómica del día."""
+    if topic:
+        data = await http_json(
+            "https://images-api.nasa.gov/search",
+            {"q": topic, "media_type": "image", "page_size": 3},
+        )
+        items = ((data or {}).get("collection") or {}).get("items") or []
+        if not items:
+            raise CommandError(f"La NASA no tiene imágenes de «{topic}». Prueba otra palabra.")
+        lines = [f"🚀 NASA — imágenes de «{topic}»", ""]
+        image: str | None = None
+        for item in items[:3]:
+            info = (item.get("data") or [{}])[0]
+            title = info.get("title") or "Sin título"
+            date = (info.get("date_created") or "")[:10]
+            nasa_id = info.get("nasa_id") or ""
+            lines.append(f"• {title} ({date})")
+            if nasa_id:
+                lines.append(f"  https://images.nasa.gov/details/{nasa_id}")
+            if image is None:
+                links = item.get("links") or []
+                if links:
+                    image = links[0].get("href")
+        return "\n".join(lines), image
+
+    # La foto de hoy a veces falla en la API, así que pido la de ayer.
+    day = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+    data = await http_json(
+        "https://api.nasa.gov/planetary/apod",
+        {"api_key": KEYS.get("nasa") or "DEMO_KEY", "date": day},
+    )
+    if not isinstance(data, dict) or not data.get("title"):
+        raise CommandError("La NASA no respondió bien ahora mismo. Prueba en un rato.")
+    if data.get("media_type") != "image" or "To view this video" in str(
+        data.get("explanation") or ""
+    ):
+        # Algunos días la foto del día es un vídeo: muestro imágenes de NASA.
+        return await nasa_report("astronomy")
+    lines = [
+        f"🚀 {data.get('title')} ({data.get('date')})",
+        "",
+        truncate(strip_html(data.get("explanation")), 900),
+    ]
+    if data.get("copyright"):
+        lines.append(f"\n📸 {data['copyright']}")
+    link = data.get("hdurl") or data.get("url")
+    if link:
+        lines.append(f"\n🔗 {link}")
+    image = data.get("url") if data.get("media_type") == "image" else None
+    return "\n".join(lines), image
+
+
+async def cmd_nasa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    topic = " ".join(context.args).strip() if context.args else ""
+    text, image = await nasa_report(topic or None)
+    if image:
+        await update.effective_message.reply_photo(photo=image, caption=truncate(text, 1000))
+    else:
+        await update.effective_message.reply_text(truncate(text))
+
+
+# --------------------------------------------------------------------------
+# Recetas y cócteles (TheMealDB / TheCocktailDB, clave pública "1")
+# --------------------------------------------------------------------------
+async def meal_report(query: str | None) -> tuple[str, str | None]:
+    if query:
+        data = await http_json(
+            "https://www.themealdb.com/api/json/v1/1/search.php", {"s": query}
+        )
+    else:
+        data = await http_json("https://www.themealdb.com/api/json/v1/1/random.php")
+    meals = (data.get("meals") or []) if isinstance(data, dict) else []
+    if not meals:
+        raise CommandError(
+            f"No encontré recetas de «{query}». Prueba con un plato o ingrediente en inglés "
+            "(chicken, rice, pasta…)."
+        )
+    meal = meals[0]
+    ingredients = []
+    for index in range(1, 21):
+        name = (meal.get(f"strIngredient{index}") or "").strip()
+        measure = (meal.get(f"strMeasure{index}") or "").strip()
+        if name:
+            ingredients.append(" ".join(part for part in (measure, name) if part))
+    lines = [
+        f"🍲 {meal.get('strMeal')}",
+        f"🏷 {meal.get('strCategory') or '?'}  •  "
+        f"🌎 {meal.get('strArea') or meal.get('strCountry') or '?'}",
+        "",
+        "🧺 Ingredientes:",
+        *[f"• {item}" for item in ingredients[:15]],
+        "",
+        "👩‍🍳 Preparación:",
+        truncate(strip_html(meal.get("strInstructions")), 1200),
+    ]
+    source = meal.get("strSource") or meal.get("strYoutube")
+    if source:
+        lines.append(f"\n🔗 {source}")
+    else:
+        lines.append(f"\n🔗 https://www.themealdb.com/meal/{meal.get('idMeal')}")
+    return "\n".join(lines), meal.get("strMealThumb")
+
+
+async def cmd_receta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = " ".join(context.args).strip() if context.args else ""
+    text, image = await meal_report(query or None)
+    if image:
+        await update.effective_message.reply_photo(photo=image, caption=truncate(text, 1000))
+    else:
+        await update.effective_message.reply_text(truncate(text))
+
+
+async def drink_report(query: str | None) -> tuple[str, str | None]:
+    if query:
+        data = await http_json(
+            "https://www.thecocktaildb.com/api/json/v1/1/search.php", {"s": query}
+        )
+    else:
+        data = await http_json("https://www.thecocktaildb.com/api/json/v1/1/random.php")
+    drinks = (data.get("drinks") or []) if isinstance(data, dict) else []
+    if not drinks:
+        raise CommandError(f"No encontré cócteles de «{query}». Prueba con otro nombre.")
+    drink = drinks[0]
+    ingredients = []
+    for index in range(1, 16):
+        name = (drink.get(f"strIngredient{index}") or "").strip()
+        measure = (drink.get(f"strMeasure{index}") or "").strip()
+        if name:
+            ingredients.append(" ".join(part for part in (measure, name) if part))
+    lines = [
+        f"🍹 {drink.get('strDrink')}",
+        f"🏷 {drink.get('strCategory') or '?'}  •  🍸 {drink.get('strAlcoholic') or '?'}  •  "
+        f"🥃 {drink.get('strGlass') or '?'}",
+        "",
+        "🧺 Ingredientes:",
+        *[f"• {item}" for item in ingredients[:12]],
+        "",
+        "👨‍🍳 Preparación:",
+        truncate(strip_html(drink.get("strInstructions")), 1000),
+    ]
+    return "\n".join(lines), drink.get("strDrinkThumb")
+
+
+async def cmd_trago(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = " ".join(context.args).strip() if context.args else ""
+    text, image = await drink_report(query or None)
+    if image:
+        await update.effective_message.reply_photo(photo=image, caption=truncate(text, 1000))
+    else:
+        await update.effective_message.reply_text(truncate(text))
+
+
+# --------------------------------------------------------------------------
+# Series (TVMaze) y anime (AniList, GraphQL)
+# --------------------------------------------------------------------------
+async def series_report(title: str) -> tuple[str, str | None]:
+    results = await http_json("https://api.tvmaze.com/search/shows", {"q": title})
+    if not isinstance(results, list) or not results:
+        raise CommandError(f"No encontré la serie «{title}».")
+    show = results[0].get("show") or {}
+    network = (
+        (show.get("network") or {}).get("name")
+        or (show.get("webChannel") or {}).get("name")
+        or "?"
+    )
+    rating = (show.get("rating") or {}).get("average")
+    lines = [
+        f"📺 {show.get('name')}",
+        f"🏷 {', '.join(show.get('genres') or []) or 'sin género'}  •  📡 {network}",
+        f"📅 {show.get('premiered') or '?'} → {show.get('ended') or 'en emisión'}  •  "
+        f"⭐ {rating or '?'}/10",
+        f"📆 Estado: {show.get('status') or '?'}",
+        "",
+        truncate(strip_html(show.get("summary")) or "Sin sinopsis.", 900),
+        f"\n🔗 {show.get('url') or ''}",
+    ]
+    image = (show.get("image") or {}).get("medium")
+    return "\n".join(lines), image
+
+
+async def cmd_serie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    title = require_args(context, "/serie <título>   ej. /serie dark")
+    text, image = await series_report(title)
+    if image:
+        await update.effective_message.reply_photo(photo=image, caption=truncate(text, 1000))
+    else:
+        await update.effective_message.reply_text(truncate(text))
+
+
+ANILIST_QUERY = """
+query ($search: String) {
+  Media(search: $search, type: ANIME) {
+    title { romaji english }
+    format status episodes averageScore genres
+    description(asHtml: false)
+    siteUrl
+    coverImage { large }
+  }
+}
+"""
+
+
+async def anime_report(title: str) -> tuple[str, str | None]:
+    data = await http_post_json(
+        "https://graphql.anilist.co",
+        {"query": ANILIST_QUERY, "variables": {"search": title}},
+    )
+    media = ((data or {}).get("data") or {}).get("Media") if isinstance(data, dict) else None
+    if not media:
+        raise CommandError(f"No encontré el anime «{title}».")
+    names = media.get("title") or {}
+    heading = names.get("romaji") or title
+    if names.get("english"):
+        heading += f" ({names['english']})"
+    lines = [
+        f"🍥 {heading}",
+        f"📺 {media.get('format') or '?'}  •  📆 {media.get('status') or '?'}  •  "
+        f"🎞 {media.get('episodes') or '?'} episodios",
+        f"⭐ {media.get('averageScore') or '?'}/100  •  "
+        f"🏷 {', '.join(media.get('genres') or []) or '?'}",
+        "",
+        truncate(strip_html(media.get("description")) or "Sin sinopsis.", 900),
+        f"\n🔗 {media.get('siteUrl')}",
+    ]
+    return "\n".join(lines), (media.get("coverImage") or {}).get("large")
+
+
+async def cmd_anime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    title = require_args(context, "/anime <título>   ej. /anime one piece")
+    text, image = await anime_report(title)
+    if image:
+        await update.effective_message.reply_photo(photo=image, caption=truncate(text, 1000))
+    else:
+        await update.effective_message.reply_text(truncate(text))
+
+
+# --------------------------------------------------------------------------
+# Libros (Open Library), aire (Open-Meteo) y países
+# --------------------------------------------------------------------------
+async def book_report(title: str) -> tuple[str, str | None]:
+    data = await http_json("https://openlibrary.org/search.json", {"q": title, "limit": 1})
+    docs = (data.get("docs") or []) if isinstance(data, dict) else []
+    if not docs:
+        raise CommandError(f"No encontré el libro «{title}» en Open Library.")
+    book = docs[0]
+    authors = ", ".join((book.get("author_name") or [])[:3]) or "autor desconocido"
+    pages = book.get("number_of_pages_median")
+    lines = [
+        f"📖 {book.get('title')}",
+        f"✍️ {authors}",
+        f"📅 {book.get('first_publish_year') or '?'}  •  📄 {pages or '?'} páginas",
+        f"\n🔗 https://openlibrary.org{book.get('key')}",
+    ]
+    cover = None
+    if book.get("cover_i"):
+        cover = f"https://covers.openlibrary.org/b/id/{book['cover_i']}-L.jpg"
+    return "\n".join(lines), cover
+
+
+async def cmd_libro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    title = require_args(context, "/libro <título>   ej. /libro cien años de soledad")
+    text, image = await book_report(title)
+    if image:
+        await update.effective_message.reply_photo(photo=image, caption=truncate(text, 1000))
+    else:
+        await update.effective_message.reply_text(truncate(text))
+
+
+def aqi_label(value: object) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "sin dato"
+    if number <= 20:
+        return "buena 🟢"
+    if number <= 40:
+        return "aceptable 🟡"
+    if number <= 60:
+        return "moderada 🟠"
+    if number <= 80:
+        return "mala 🔴"
+    if number <= 100:
+        return "muy mala 🟣"
+    return "peligrosa ⚫"
+
+
+async def air_report(city: str) -> str:
+    place = await geocode(city)
+    data = await http_json(
+        "https://air-quality-api.open-meteo.com/v1/air-quality",
+        {
+            "latitude": place["latitude"],
+            "longitude": place["longitude"],
+            "current": "pm2_5,pm10,ozone,nitrogen_dioxide,european_aqi,us_aqi",
+            "timezone": "auto",
+        },
+    )
+    current = (data or {}).get("current") or {}
+    if not current:
+        raise CommandError(f"No hay datos de calidad del aire para «{city}».")
+    location = ", ".join(
+        part for part in (place.get("name"), place.get("country")) if part
+    )
+    return "\n".join(
+        [
+            f"🌬 Calidad del aire en {location}",
+            f"🇪🇺 Índice europeo: {current.get('european_aqi')} — "
+            f"{aqi_label(current.get('european_aqi'))}",
+            f"🇺🇸 Índice de EE. UU.: {current.get('us_aqi')}",
+            f"😷 PM2.5: {current.get('pm2_5')} µg/m³  •  PM10: {current.get('pm10')} µg/m³",
+            f"🧪 Ozono: {current.get('ozone')} µg/m³  •  "
+            f"NO₂: {current.get('nitrogen_dioxide')} µg/m³",
+            f"🕒 Medido: {current.get('time')}",
+        ]
+    )
+
+
+async def cmd_aire(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    city = require_args(context, "/aire <ciudad>   ej. /aire Medellín")
+    await update.effective_message.reply_text(truncate(await air_report(city)))
+
+
+async def country_report(name: str) -> str:
+    data = await http_json(
+        "https://countriesnow.space/api/v0.1/countries/info",
+        {"returns": "capital,currency,flag"},
+    )
+    rows = (data.get("data") or []) if isinstance(data, dict) else []
+    query = fold(name)
+    match = next((row for row in rows if fold(str(row.get("name"))) == query), None)
+    if match is None:
+        match = next((row for row in rows if query in fold(str(row.get("name")))), None)
+    if match is None:
+        raise CommandError(
+            f"No encontré el país «{name}». Prueba con el nombre en inglés "
+            "(Peru, United States, Japan…)."
+        )
+    lines = [
+        f"🌍 {match.get('name')}",
+        f"🏛 Capital: {match.get('capital') or '?'}",
+        f"💵 Moneda: {match.get('currency') or '?'}",
+    ]
+    try:
+        summary = await http_json(
+            "https://es.wikipedia.org/api/rest_v1/page/summary/"
+            + quote(str(match.get("name")).replace(" ", "_"), safe="")
+        )
+        extract = (summary or {}).get("extract")
+        if extract:
+            lines.extend(["", truncate(extract, 800)])
+    except (HTTPError, URLError, TimeoutError, OSError):
+        pass
+    if match.get("flag"):
+        lines.append(f"\n🏳 {match['flag']}")
+    return "\n".join(lines)
+
+
+async def cmd_pais(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    name = require_args(context, "/pais <nombre>   ej. /pais Colombia")
+    await update.effective_message.reply_text(truncate(await country_report(name)))
+
+
+# --------------------------------------------------------------------------
+# Stack Overflow, radio, Minecraft, baraja y trivia
+# --------------------------------------------------------------------------
+async def stack_report(query: str) -> str:
+    data = await http_json(
+        "https://api.stackexchange.com/2.3/search/advanced",
+        {
+            "order": "desc",
+            "sort": "relevance",
+            "q": query,
+            "site": "stackoverflow",
+            "pagesize": 3,
+            "filter": "default",
+        },
+    )
+    items = (data.get("items") or []) if isinstance(data, dict) else []
+    if not items:
+        raise CommandError(f"No encontré preguntas de «{query}» en Stack Overflow.")
+    lines = [f"💻 Stack Overflow — «{query}»", ""]
+    for item in items[:3]:
+        lines.append(f"• {html.unescape(item.get('title') or '')}")
+        lines.append(
+            f"  👍 {item.get('score', 0)}  •  ✅ {item.get('answer_count', 0)} respuestas  •  "
+            f"👀 {item.get('view_count', 0)} visitas"
+        )
+        lines.append(f"  {item.get('link')}")
+    return "\n".join(lines)
+
+
+async def cmd_stack(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = require_args(context, "/stack <búsqueda>   ej. /stack telegram bot python")
+    await update.effective_message.reply_text(truncate(await stack_report(query)))
+
+
+async def radio_report(query: str) -> str:
+    data = await http_json(
+        "https://de1.api.radio-browser.info/json/stations/search",
+        {
+            "name": query,
+            "limit": 3,
+            "hidebroken": "true",
+            "order": "clickcount",
+            "reverse": "true",
+        },
+    )
+    stations = data if isinstance(data, list) else []
+    if not stations:
+        raise CommandError(f"No encontré emisoras de «{query}».")
+    lines = [f"📻 Emisoras para «{query}»", ""]
+    for station in stations[:3]:
+        lines.append(f"• {str(station.get('name') or '').strip()}")
+        details = [
+            station.get("country"),
+            f"{station.get('bitrate') or '?'} kbps",
+            station.get("codec"),
+        ]
+        lines.append("  " + " • ".join(str(part) for part in details if part))
+        stream = station.get("url_resolved") or station.get("url")
+        if stream:
+            lines.append(f"  {stream}")
+        if station.get("homepage"):
+            lines.append(f"  {station['homepage']}")
+    return "\n".join(lines)
+
+
+async def cmd_radio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = require_args(context, "/radio <nombre>   ej. /radio salsa")
+    await update.effective_message.reply_text(truncate(await radio_report(query)))
+
+
+async def minecraft_report(host: str) -> str:
+    data = await http_json(
+        f"https://api.mcsrvstat.us/3/{quote(host.strip(), safe='')}"
+    )
+    if not isinstance(data, dict):
+        raise CommandError("El servicio de Minecraft no respondió. Prueba otra vez.")
+    if not data.get("online"):
+        raise CommandError(f"El servidor «{host}» está apagado, no existe o no responde.")
+    players = data.get("players") or {}
+    version = data.get("version") or "?"
+    if isinstance(version, dict):
+        version = version.get("name") or "?"
+    motd = " ".join((data.get("motd") or {}).get("clean") or [])
+    lines = [
+        f"⛏ {host} — en línea 🟢",
+        f"👥 Jugadores: {players.get('online', 0)}/{players.get('max', 0)}",
+        f"🧩 Versión: {version}",
+    ]
+    if motd:
+        lines.append(f"💬 {motd}")
+    names = players.get("list") or []
+    if names:
+        lines.append("🙋 " + ", ".join(str(name) for name in names[:10]))
+    return "\n".join(lines)
+
+
+async def cmd_mc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    host = require_args(context, "/mc <servidor>   ej. /mc mc.hypixel.net")
+    await update.effective_message.reply_text(truncate(await minecraft_report(host)))
+
+
+CARD_SUITS = {"HEARTS": "♥️", "DIAMONDS": "♦️", "CLUBS": "♣️", "SPADES": "♠️"}
+CARD_VALUES = {"JACK": "J", "QUEEN": "Q", "KING": "K", "ACE": "A"}
+
+
+async def cards_report(count: int) -> tuple[str, str | None]:
+    data = await http_json(
+        "https://deckofcardsapi.com/api/deck/new/draw/", {"count": count}
+    )
+    cards = (data.get("cards") or []) if isinstance(data, dict) else []
+    if not cards:
+        raise CommandError("La baraja no respondió. Prueba otra vez.")
+    shown = []
+    for card in cards:
+        suit = CARD_SUITS.get(card.get("suit"), "")
+        value = CARD_VALUES.get(card.get("value"), card.get("value"))
+        shown.append(f"{suit} {value}")
+    return "🃏 " + "   ".join(shown), cards[0].get("image")
+
+
+async def cmd_carta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    count = 1
+    if context.args:
+        try:
+            count = int(context.args[0])
+        except ValueError:
+            raise CommandError("Uso: /carta [cantidad]   ej. /carta 3")
+    if not 1 <= count <= 10:
+        raise CommandError("Puedo sacar entre 1 y 10 cartas.")
+    text, image = await cards_report(count)
+    if image:
+        await update.effective_message.reply_photo(photo=image, caption=text)
+    else:
+        await update.effective_message.reply_text(text)
+
+
+async def trivia_report() -> str:
+    data = await http_json(
+        "https://opentdb.com/api.php",
+        {"amount": 1, "type": "multiple", "encode": "url3986"},
+    )
+    results = (data.get("results") or []) if isinstance(data, dict) else []
+    if not results:
+        raise CommandError("No pude sacar una pregunta. Prueba otra vez en un momento.")
+    item = results[0]
+    question = unquote_plus(item.get("question") or "")
+    correct = unquote_plus(item.get("correct_answer") or "")
+    options = [unquote_plus(option) for option in item.get("incorrect_answers") or []]
+    options.append(correct)
+    random.shuffle(options)
+    letters = "ABCDEF"
+    lines = [f"❓ {question}", ""]
+    for index, option in enumerate(options):
+        lines.append(f"{letters[index]}. {option}")
+    lines.append("")
+    lines.append(
+        f"🏷 {unquote_plus(item.get('category') or '?')}  •  "
+        f"🎚 {unquote_plus(item.get('difficulty') or '?')}"
+    )
+    lines.append(f"✅ Respuesta: {correct}")
+    return "\n".join(lines)
+
+
+async def cmd_trivia(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(truncate(await trivia_report()))
+
+
+# --------------------------------------------------------------------------
+# Internet Archive, Telegraph y sol
+# --------------------------------------------------------------------------
+async def wayback_report(url: str) -> str:
+    data = await http_json("https://archive.org/wayback/available", {"url": url})
+    snapshot = ((data or {}).get("archived_snapshots") or {}).get("closest") or {}
+    if not snapshot.get("available"):
+        raise CommandError(
+            "Internet Archive no tiene copia de esa página.\n"
+            f"Puedes guardarla a mano en https://web.archive.org/save/{url}"
+        )
+    stamp = str(snapshot.get("timestamp") or "")
+    when = "fecha desconocida"
+    if len(stamp) >= 12:
+        when = f"{stamp[0:4]}-{stamp[4:6]}-{stamp[6:8]} {stamp[8:10]}:{stamp[10:12]}"
+    return f"🕰 Copia más cercana: {when}\n🔗 {snapshot.get('url')}"
+
+
+async def cmd_wayback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    url = require_args(context, "/wayback <url>   ej. /wayback google.com")
+    await update.effective_message.reply_text(truncate(await wayback_report(url)))
+
+
+async def publish_report(title: str, body_text: str) -> str:
+    account = await http_post_json(
+        "https://api.telegra.ph/createAccount",
+        {"short_name": "botpy", "author_name": "Bot"},
+    )
+    token = ((account or {}).get("result") or {}).get("access_token")
+    if not token:
+        raise CommandError("Telegraph no me dejó publicar ahora mismo.")
+    paragraphs = [line.strip() for line in body_text.splitlines() if line.strip()]
+    if not paragraphs:
+        raise CommandError("No hay texto para publicar.")
+    content = [{"tag": "p", "children": [line]} for line in paragraphs[:120]]
+    page = await http_post_json(
+        "https://api.telegra.ph/createPage",
+        {
+            "access_token": token,
+            "title": title[:256],
+            "author_name": "Bot",
+            "content": content,
+        },
+    )
+    result = (page or {}).get("result") or {}
+    if not result.get("url"):
+        error = (page or {}).get("error") or "error desconocido"
+        raise CommandError(f"Telegraph rechazó la publicación: {error}")
+    return f"📝 Publicado: {result['url']}"
+
+
+async def cmd_publicar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    raw = require_args(
+        context, "/publicar [título |] <texto>   ej. /publicar Mis notas | Hola mundo"
+    )
+    if len(raw) > 6000:
+        raise CommandError("El texto es muy largo: mándame menos de 6000 caracteres.")
+    if "|" in raw:
+        title, body_text = raw.split("|", 1)
+    else:
+        title, body_text = "Publicación del bot", raw
+    await update.effective_message.reply_text(truncate(await publish_report(title.strip(), body_text)))
+
+
+async def sun_report(city: str) -> str:
+    place = await geocode(city)
+    data = await http_json(
+        "https://api.open-meteo.com/v1/forecast",
+        {
+            "latitude": place["latitude"],
+            "longitude": place["longitude"],
+            "daily": "sunrise,sunset,daylight_duration",
+            "timezone": "auto",
+            "forecast_days": 1,
+        },
+    )
+    daily = (data or {}).get("daily") or {}
+    sunrise = (daily.get("sunrise") or [None])[0]
+    sunset = (daily.get("sunset") or [None])[0]
+    if not sunrise or not sunset:
+        raise CommandError(f"No hay datos de sol para «{city}».")
+    duration = (daily.get("daylight_duration") or [0])[0]
+    hours, minutes = divmod(int(duration or 0) // 60, 60)
+    location = ", ".join(
+        part for part in (place.get("name"), place.get("country")) if part
+    )
+    return "\n".join(
+        [
+            f"🌅 {location}",
+            f"☀️ Amanecer: {str(sunrise)[11:16]}",
+            f"🌇 Atardecer: {str(sunset)[11:16]}",
+            f"⏳ Duración del día: {hours} h {minutes} min",
+        ]
+    )
+
+
+async def cmd_sol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    city = require_args(context, "/sol <ciudad>   ej. /sol Bogotá")
+    await update.effective_message.reply_text(truncate(await sun_report(city)))
+
+
+# --------------------------------------------------------------------------
+# Acciones (Twelve Data) y claves de APIs
+# --------------------------------------------------------------------------
+async def stock_report(symbol: str) -> str:
+    key = KEYS.get("twelvedata") or "demo"
+    try:
+        data = await http_json(
+            "https://api.twelvedata.com/quote", {"symbol": symbol.upper(), "apikey": key}
+        )
+    except HTTPError as exc:
+        # Twelve Data responde 401 con el motivo en el cuerpo.
+        raw = await asyncio.to_thread(exc.read)
+        try:
+            data = json.loads(raw.decode("utf-8", "replace"))
+        except ValueError:
+            data = {"message": f"Twelve Data respondió {exc.code}."}
+    if not isinstance(data, dict) or data.get("code") or data.get("status") == "error":
+        message = (data or {}).get("message") if isinstance(data, dict) else None
+        hint = ""
+        if str((data or {}).get("code")) == "401":
+            hint = (
+                "\n\nCon la clave \"demo\" solo funcionan AAPL, BTC/USD y EUR/USD. "
+                "Pide tu clave gratis en https://twelvedata.com/pricing y pégala en "
+                "KEYS['twelvedata'] al inicio de bot.py (ver /claves)."
+            )
+        raise CommandError((message or f"No encontré el símbolo «{symbol}».") + hint)
+    try:
+        change = float(data.get("change") or 0)
+    except (TypeError, ValueError):
+        change = 0.0
+    arrow = "📈" if change >= 0 else "📉"
+    close = data.get("close") or 0
+    try:
+        price = money(float(close))
+    except (TypeError, ValueError):
+        price = str(close)
+    market = "mercado abierto 🟢" if data.get("is_market_open") else "mercado cerrado 🔴"
+    return "\n".join(
+        [
+            f"{arrow} {data.get('name') or symbol.upper()} ({data.get('symbol')})",
+            f"🏦 {data.get('exchange') or '?'}  •  💵 {data.get('currency') or '?'}",
+            f"💰 Precio: {price}",
+            f"🔁 Cambio: {data.get('change')} ({data.get('percent_change')}%)",
+            f"📊 Abrió {data.get('open')}  •  ⬆️ {data.get('high')}  •  "
+            f"⬇️ {data.get('low')}",
+            f"🕒 {data.get('datetime') or ''}  •  {market}",
+        ]
+    )
+
+
+async def cmd_accion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    symbol = require_args(context, "/accion <símbolo>   ej. /accion AAPL")
+    await update.effective_message.reply_text(truncate(await stock_report(symbol)))
+
+
+def mask_key(value: str) -> str:
+    if not value:
+        return "vacía"
+    if len(value) <= 8:
+        return value[:2] + "…"
+    return f"{value[:4]}…{value[-4:]}"
+
+
+async def cmd_claves(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    lines = ["🔑 Claves de APIs", ""]
+    for name, label, url, note in KEY_INFO:
+        current = KEYS.get(name, "")
+        state = f"puesta ({mask_key(current)})" if current else "vacía"
+        lines.append(f"• {label}: {state}")
+        lines.append(f"  {note}")
+        lines.append(f"  {url}")
+    lines.append("")
+    lines.append(
+        "Pégalas en el diccionario KEYS al inicio de bot.py y reinicia el bot. "
+        "Todas tienen plan gratis y el bot funciona sin ellas."
+    )
+    await update.effective_message.reply_text(truncate("\n".join(lines)))
+
+
+# --------------------------------------------------------------------------
+# GIF y películas (necesitan clave propia y gratis)
+# --------------------------------------------------------------------------
+async def gif_report(query: str) -> str:
+    key = KEYS.get("giphy", "")
+    if not key:
+        raise CommandError(
+            "Para /gif necesito una clave gratis de Giphy.\n"
+            "Créala en https://developers.giphy.com/dashboard/ y pégala en "
+            "KEYS['giphy'] al inicio de bot.py. (Ver /claves)"
+        )
+    data = await http_json(
+        "https://api.giphy.com/v1/gifs/search",
+        {"api_key": key, "q": query, "limit": 1, "rating": "g", "lang": "es"},
+    )
+    hits = (data.get("data") or []) if isinstance(data, dict) else []
+    if not hits:
+        raise CommandError(f"No encontré GIFs de «{query}». Prueba con otra palabra.")
+    gif = hits[0]
+    media = (gif.get("images") or {}).get("fixed_height") or {}
+    url = media.get("url") or gif.get("url")
+    if not url:
+        raise CommandError("Giphy no devolvió el GIF.")
+    return html.unescape(gif.get("title") or query), url
+
+
+async def cmd_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = require_args(context, "/gif <búsqueda>   ej. /gif gato bailando")
+    caption, url = await gif_report(query)
+    await update.effective_message.reply_animation(animation=url, caption=truncate(caption, 200))
+
+
+async def movie_report(title: str) -> tuple[str, str | None]:
+    key = KEYS.get("omdb", "")
+    if not key:
+        raise CommandError(
+            "Para /pelicula necesito una clave gratis de OMDb.\n"
+            "Pídela en https://www.omdbapi.com/apikey.aspx y pégala en "
+            "KEYS['omdb'] al inicio de bot.py. (Ver /claves)"
+        )
+    data = await http_json(
+        "https://www.omdbapi.com/", {"apikey": key, "t": title, "plot": "short"}
+    )
+    if not isinstance(data, dict) or data.get("Response") == "False":
+        error = (data or {}).get("Error") if isinstance(data, dict) else None
+        raise CommandError(f"No encontré la película «{title}». {error or ''}".strip())
+    lines = [
+        f"🎬 {data.get('Title')} ({data.get('Year')})",
+        f"🏷 {data.get('Genre')}  •  ⏱ {data.get('Runtime')}  •  "
+        f"⭐ {data.get('imdbRating')}/10",
+        f"🎥 Director: {data.get('Director')}",
+        f"👥 {data.get('Actors')}",
+        "",
+        truncate(data.get("Plot") or "Sin sinopsis.", 700),
+        f"\n🔗 https://www.imdb.com/title/{data.get('imdbID')}/",
+    ]
+    poster = data.get("Poster")
+    image = poster if poster and poster != "N/A" else None
+    return "\n".join(lines), image
+
+
+async def cmd_pelicula(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    title = require_args(context, "/pelicula <título>   ej. /pelicula matrix")
+    text, image = await movie_report(title)
+    if image:
+        await update.effective_message.reply_photo(photo=image, caption=truncate(text, 1000))
+    else:
+        await update.effective_message.reply_text(truncate(text))
+
+
+# --------------------------------------------------------------------------
 # Errores
 # --------------------------------------------------------------------------
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1167,6 +2039,26 @@ HANDLERS = {
     "acortar": cmd_acortar,
     "dado": cmd_dado,
     "moneda": cmd_moneda,
+    "nasa": cmd_nasa,
+    "receta": cmd_receta,
+    "trago": cmd_trago,
+    "serie": cmd_serie,
+    "anime": cmd_anime,
+    "libro": cmd_libro,
+    "aire": cmd_aire,
+    "pais": cmd_pais,
+    "stack": cmd_stack,
+    "radio": cmd_radio,
+    "mc": cmd_mc,
+    "carta": cmd_carta,
+    "trivia": cmd_trivia,
+    "wayback": cmd_wayback,
+    "publicar": cmd_publicar,
+    "sol": cmd_sol,
+    "accion": cmd_accion,
+    "gif": cmd_gif,
+    "pelicula": cmd_pelicula,
+    "claves": cmd_claves,
     "echo": cmd_echo,
 }
 
