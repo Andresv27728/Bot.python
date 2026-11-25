@@ -1,0 +1,11 @@
+# Token del bot: nunca se sube al repo
+token.txt
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Restos de la auto-actualización
+bot.py.new
