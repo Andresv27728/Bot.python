@@ -57,7 +57,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.7"
+VERSION = "3.8"
 START_TIME = time.time()
 
 # --------------------------------------------------------------------------
@@ -2642,19 +2642,41 @@ async def cmd_dato(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(truncate(await fact_report()))
 
 
-async def tcg_report(query: str) -> str:
+async def tcg_image(base: object) -> bytes | None:
+    """Descarga la imagen de la carta (TCGdex da la URL sin extensión)."""
+    if not isinstance(base, str) or not base:
+        return None
+    candidates = [base] if re.search(r"\.(png|jpe?g|webp)$", base, re.I) else [
+        base + "/high.png",
+        base + "/low.png",
+    ]
+    for url in candidates:
+        blob = await asyncio.to_thread(_download_media, url)
+        if blob:
+            return blob
+    return None
+
+
+async def tcg_report(query: str) -> tuple[str, bytes | None]:
     cards = await http_json(
         "https://api.tcgdex.net/v2/es/cards?name="
-        f"{quote(query)}&pagination:itemsPerPage=1"
+        f"{quote(query)}&pagination:itemsPerPage=6"
     )
     if not isinstance(cards, list) or not cards:
         raise CommandError(f"No encontré cartas Pokémon de «{query}».")
-    card = cards[0]
-    detail = await http_json(
-        f"https://api.tcgdex.net/v2/es/cards/{card.get('id')}"
+    ids = [
+        str(card.get("id")) for card in cards if isinstance(card, dict) and card.get("id")
+    ][:6]
+    details = await asyncio.gather(
+        *(http_json(f"https://api.tcgdex.net/v2/es/cards/{card_id}") for card_id in ids),
+        return_exceptions=True,
     )
-    info = detail if isinstance(detail, dict) else {}
-    lines = [f"🃏 {info.get('name') or card.get('name')}"]
+    found = [detail for detail in details if isinstance(detail, dict)]
+    if not found:
+        raise CommandError(f"No pude leer los datos de «{query}» en TCGdex.")
+    # Las expansiones nuevas a veces no tienen imagen en español: uso la primera que sí.
+    info = next((detail for detail in found if detail.get("image")), found[0])
+    lines = [f"🃏 {info.get('name') or query}"]
     if info.get("category"):
         lines.append(
             f"🏷 {info.get('category')}  •  ⭐ {info.get('rarity') or '?'}"
@@ -2668,12 +2690,21 @@ async def tcg_report(query: str) -> str:
         lines.append("⚡ Tipo: " + ", ".join(str(t) for t in types))
     if info.get("description"):
         lines += ["", truncate(str(info.get("description")), 600)]
-    return "\n".join(lines)
+    image = await tcg_image(info.get("image"))
+    return "\n".join(lines), image
 
 
 async def cmd_tcg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = require_args(context, "/tcg <carta>   ej. /tcg pikachu")
-    await update.effective_message.reply_text(truncate(await tcg_report(query)))
+    report, image = await tcg_report(query)
+    message = update.effective_message
+    if image:
+        try:
+            await message.reply_photo(photo=image, caption=truncate(report, 1000))
+            return
+        except TelegramError:
+            pass
+    await message.reply_text(truncate(report))
 
 
 async def f1_report() -> str:
