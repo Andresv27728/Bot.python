@@ -61,7 +61,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.15"
+VERSION = "3.16"
 START_TIME = time.time()
 LAST_UPDATE_CHECK = START_TIME
 
@@ -1134,7 +1134,7 @@ async def cmd_sismos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # --------------------------------------------------------------------------
 # Pokémon (PokeAPI, sin key)
 # --------------------------------------------------------------------------
-async def pokemon_report(name: str) -> str:
+async def pokemon_report(name: str) -> tuple[str, str | None]:
     data = await http_json(
         f"https://pokeapi.co/api/v2/pokemon/{quote(name.strip().lower(), safe='')}"
     )
@@ -1153,12 +1153,23 @@ async def pokemon_report(name: str) -> str:
         f"❤️ PS {stats.get('hp', '?')}  •  ⚔️ ATQ {stats.get('attack', '?')}  •  "
         f"🛡 DEF {stats.get('defense', '?')}  •  💨 VEL {stats.get('speed', '?')}",
     ]
-    return "\n".join(lines)
+    sprites = data.get("sprites") or {}
+    artwork = (sprites.get("other") or {}).get("official-artwork") or {}
+    image = artwork.get("front_default") or sprites.get("front_default")
+    return "\n".join(lines), (str(image) if image else None)
 
 
 async def cmd_pokemon(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     name = require_args(context, "/pokemon <nombre>   ej. /pokemon pikachu")
-    await update.effective_message.reply_text(truncate(await pokemon_report(name)))
+    report, image = await pokemon_report(name)
+    message = update.effective_message
+    if image:
+        try:
+            await message.reply_photo(photo=image, caption=truncate(report, 1000))
+            return
+        except TelegramError:
+            pass
+    await message.reply_text(truncate(report))
 
 
 # --------------------------------------------------------------------------
