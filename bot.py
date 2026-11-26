@@ -61,7 +61,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.14"
+VERSION = "3.15"
 START_TIME = time.time()
 LAST_UPDATE_CHECK = START_TIME
 
@@ -1146,8 +1146,6 @@ async def pokemon_report(name: str) -> str:
     stats = {entry["stat"]["name"]: entry["base_stat"] for entry in data.get("stats") or []}
     height = (data.get("height") or 0) / 10
     weight = (data.get("weight") or 0) / 10
-    artwork = ((data.get("sprites") or {}).get("other") or {}).get("official-artwork") or {}
-    image = artwork.get("front_default") or (data.get("sprites") or {}).get("front_default")
     lines = [
         f"⚡ #{data.get('id')} {str(data.get('name')).capitalize()}",
         f"🧬 Tipo: {types or '?'}",
@@ -1155,8 +1153,6 @@ async def pokemon_report(name: str) -> str:
         f"❤️ PS {stats.get('hp', '?')}  •  ⚔️ ATQ {stats.get('attack', '?')}  •  "
         f"🛡 DEF {stats.get('defense', '?')}  •  💨 VEL {stats.get('speed', '?')}",
     ]
-    if image:
-        lines.append(f"🖼 {image}")
     return "\n".join(lines)
 
 
