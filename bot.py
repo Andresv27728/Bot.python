@@ -52,7 +52,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.3"
+VERSION = "3.4"
 START_TIME = time.time()
 
 # --------------------------------------------------------------------------
@@ -179,6 +179,7 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("mp4", " <enlace|búsqueda>", "descarga el vídeo de YouTube"),
     ("spotify", " <búsqueda>", "busca canciones en Spotify"),
     ("spotifydl", " <enlace>", "descarga una canción de Spotify"),
+    ("ytmusic", " <búsqueda>", "busca música en YouTube Music"),
     ("pinterest", " <búsqueda>", "imágenes de Pinterest"),
     ("instagram", " <enlace>", "descarga foto o vídeo de Instagram"),
     ("facebook", " <enlace>", "descarga un vídeo de Facebook"),
@@ -3209,6 +3210,103 @@ async def cmd_apistatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # --------------------------------------------------------------------------
+# OMEGA TECH API: búsqueda de música en YouTube Music
+# (https://api.omegatech.app/api/download/play)
+# --------------------------------------------------------------------------
+OMEGA_BASE = "https://api.omegatech.app"
+OMEGA_TIMEOUT = 90
+
+
+async def omega_json(
+    path: str, params: dict | None = None, timeout: int = OMEGA_TIMEOUT
+) -> object:
+    """GET a la API de Omega Tech, que responde {success, data} o {success, error}."""
+    url = _build_url(OMEGA_BASE + path, params)
+    try:
+        status, body, _ = await asyncio.to_thread(
+            _fetch_url, url, "application/json", timeout
+        )
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        raise CommandError(f"No pude conectar con Omega Tech: {exc}")
+    try:
+        data = json.loads(body.decode("utf-8", "replace"))
+    except ValueError:
+        raise CommandError("Omega Tech devolvió una respuesta que no entiendo.")
+    if isinstance(data, dict) and data.get("success") is False:
+        raise CommandError(
+            str(data.get("error") or data.get("message") or f"Omega Tech falló (HTTP {status}).")
+        )
+    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+        return data["data"]
+    return data
+
+
+def _omega_link(item: dict) -> str:
+    """Enlace reproducible de un resultado (vídeo normal, para poder usar /mp3)."""
+    video = item.get("videoId")
+    if video:
+        return f"https://www.youtube.com/watch?v={video}"
+    return str(item.get("url") or "")
+
+
+async def cmd_ytmusic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = require_args(
+        context, "/ytmusic <búsqueda>   ej. /ytmusic alone"
+    )
+    data = await omega_json(
+        "/api/download/play",
+        {"action": "search", "query": query, "format": "mp3"},
+        timeout=OMEGA_TIMEOUT,
+    )
+    if not isinstance(data, dict):
+        raise CommandError("YouTube Music no devolvió resultados.")
+    lines = [f"🎧 YouTube Music: {query}"]
+    seen: set[str] = set()
+    top = data.get("topResult")
+    if isinstance(top, dict) and top.get("title") and top.get("videoId"):
+        seen.add(str(top["videoId"]))
+        subtitles = top.get("subtitles")
+        extra = ""
+        if isinstance(subtitles, list) and len(subtitles) > 1:
+            extra = f" — {subtitles[1]}"
+        lines.append(f"\n⭐ Mejor resultado: {top.get('title')}{extra}")
+        link = _omega_link(top)
+        if link:
+            lines.append(f"   {link}")
+    songs = data.get("songs") if isinstance(data.get("songs"), list) else []
+    shown = 0
+    if songs:
+        lines.append("")
+    for song in songs:
+        if shown >= 8:
+            break
+        if not isinstance(song, dict) or not song.get("title"):
+            continue
+        video = str(song.get("videoId") or "")
+        if video and video in seen:
+            continue
+        if video:
+            seen.add(video)
+        shown += 1
+        artist = str(song.get("artist") or "").strip()
+        lines.append(f"{shown}. {song.get('title')}" + (f" — {artist}" if artist else ""))
+        link = _omega_link(song)
+        if link:
+            lines.append(f"   {link}")
+    if not shown:
+        albums = [a for a in data.get("albums") or [] if isinstance(a, dict) and a.get("title")]
+        if not albums:
+            raise CommandError(f"YouTube Music no encontró canciones para «{query}».")
+        lines.append("")
+        for album in albums[:5]:
+            artist = str(album.get("artist") or "").strip()
+            lines.append(f"💿 {album.get('title')}" + (f" — {artist}" if artist else ""))
+    lines.append("")
+    lines.append("Para bajar el audio de una: /mp3 <enlace>")
+    await update.effective_message.reply_text(truncate("\n".join(lines)))
+
+
+# --------------------------------------------------------------------------
 # Errores
 # --------------------------------------------------------------------------
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3406,6 +3504,7 @@ HANDLERS = {
     "mp4": cmd_mp4,
     "spotify": cmd_spotify,
     "spotifydl": cmd_spotifydl,
+    "ytmusic": cmd_ytmusic,
     "pinterest": cmd_pinterest,
     "instagram": cmd_instagram,
     "facebook": cmd_facebook,
