@@ -61,7 +61,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.13"
+VERSION = "3.14"
 START_TIME = time.time()
 LAST_UPDATE_CHECK = START_TIME
 
@@ -188,7 +188,7 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("covid", " [país]", "datos de COVID-19 de un país o del mundo"),
     ("app", " <búsqueda>", "busca apps en la App Store"),
     ("mp3", " <enlace|búsqueda>", "descarga el audio de un vídeo de YouTube"),
-    ("mp4", " <enlace|búsqueda>", "descarga el vídeo de YouTube"),
+    ("mp4", " [calidad] <enlace|búsqueda>", "descarga un vídeo de YouTube (360p, 720p…)"),
     ("spotify", " <búsqueda>", "busca canciones en Spotify"),
     ("spotifydl", " <enlace>", "descarga una canción de Spotify"),
     ("ytmusic", " <búsqueda>", "busca música en YouTube Music"),
@@ -3178,7 +3178,28 @@ def _resolution(value: object) -> int:
     return int(match.group(1)) if match else 0
 
 
-def youtube_candidates(info: dict, want: str) -> list[dict]:
+QUALITY_HEIGHTS = (144, 240, 360, 480, 720, 1080, 1440, 2160)
+
+
+def split_quality(text: str) -> tuple[str, int | None]:
+    """Separa una calidad tipo «360» o «720p» del resto (devuelve texto y altura)."""
+    tokens = text.split()
+    for index, token in enumerate(tokens):
+        match = re.fullmatch(r"(\d{3,4})p?", token.strip().lower())
+        if not match:
+            continue
+        height = int(match.group(1))
+        if height not in QUALITY_HEIGHTS:
+            continue
+        rest = " ".join(tokens[:index] + tokens[index + 1 :]).strip()
+        if rest:
+            return rest, height
+    return text, None
+
+
+def youtube_candidates(
+    info: dict, want: str, height: int | None = None
+) -> list[dict]:
     """Enlaces ordenados por preferencia: audio m4a/mp3 o MP4 desde 360p."""
     items = info.get("results") or []
     if want == "audio":
@@ -3209,6 +3230,24 @@ def youtube_candidates(info: dict, want: str) -> list[dict]:
     videos.sort(
         key=lambda item: (_resolution(item.get("quality")) or 10000, _size_bytes(item.get("fileSize")))
     )
+    if height:
+        # Calidades que pide el usuario, de la más alta a la más baja, y
+        # primero las que caben en la subida de Telegram.
+        matching = [
+            item
+            for item in videos
+            if 0 < _resolution(item.get("quality")) <= height
+        ]
+        if matching:
+            matching.sort(key=lambda item: _resolution(item.get("quality")), reverse=True)
+            fits = [
+                item
+                for item in matching
+                if not _size_bytes(item.get("fileSize"))
+                or _size_bytes(item.get("fileSize")) <= YOYO_MAX_UPLOAD
+            ]
+            return fits + [item for item in matching if item not in fits]
+        return videos
     # Prefiero la calidad más baja que siga viéndose bien (360p o más).
     good = [item for item in videos if _resolution(item.get("quality")) >= 360]
     return good + [item for item in videos if item not in good]
@@ -3220,8 +3259,16 @@ def pick_youtube_media(info: dict, want: str) -> dict | None:
 
 
 async def youtube_download(update: Update, context: ContextTypes.DEFAULT_TYPE, want: str) -> None:
-    usage = "/mp3 <enlace o búsqueda>" if want == "audio" else "/mp4 <enlace o búsqueda>"
-    target = require_args(context, usage)
+    usage = (
+        "/mp3 <enlace o búsqueda>"
+        if want == "audio"
+        else "/mp4 [calidad] <enlace o búsqueda>   ej. /mp4 360 https://youtu.be/xxxx"
+        "   (calidades: 144, 240, 360, 480, 720, 1080, 1440, 2160)"
+    )
+    raw = require_args(context, usage)
+    target, height = split_quality(raw)
+    if want == "audio":
+        height = None
     message = update.effective_message
     fmt = "mp3" if want == "audio" else "mp4"
     icon = "🎵" if want == "audio" else "🎬"
@@ -3233,14 +3280,16 @@ async def youtube_download(update: Update, context: ContextTypes.DEFAULT_TYPE, w
             info = await yoyo_json("/api/youtube/v2", {"url": link, "format": fmt})
             if not isinstance(info, dict):
                 raise CommandError("La API no devolvió información de ese vídeo.")
-            candidates = youtube_candidates(info, want)
+            candidates = youtube_candidates(info, want, height)
             if not candidates:
                 raise CommandError("No hay enlaces de descarga para ese vídeo. Prueba con otro.")
-            caption = f"{icon} {info.get('title') or 'YouTube'}"
+            title = f"{icon} {info.get('title') or 'YouTube'}"
             for chosen in candidates[:5]:
                 extension = str(
                     chosen.get("extension") or ("m4a" if want == "audio" else "mp4")
                 )
+                resolution = _resolution(chosen.get("quality")) if want == "video" else 0
+                caption = f"{title} · {resolution}p" if resolution else title
                 if await send_media_safely(
                     message, want, str(chosen["download"]), f"youtube.{extension}", caption
                 ):
@@ -3252,7 +3301,10 @@ async def youtube_download(update: Update, context: ContextTypes.DEFAULT_TYPE, w
         if not video_id:
             raise CommandError(problems[-1] if problems else "No pude leer ese enlace.")
         try:
-            await status.edit_text("⏳ Probando otro proveedor de descarga…")
+            await status.edit_text(
+                "⏳ Probando otro proveedor de descarga…"
+                + (" (este no deja elegir calidad)" if height else "")
+            )
         except TelegramError:
             pass
         try:
