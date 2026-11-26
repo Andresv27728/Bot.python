@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import base64
 import html
 import json
 import operator
@@ -52,7 +53,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.1"
+VERSION = "3.2"
 START_TIME = time.time()
 
 # --------------------------------------------------------------------------
@@ -66,6 +67,7 @@ KEYS: dict[str, str] = {
     "giphy": "",  # developers.giphy.com (necesaria para /gif)
     "omdb": "",  # omdbapi.com (necesaria para /pelicula)
     "sportsdb": "123",  # thesportsdb.com (clave de prueba pública y gratuita)
+    "yosoyyo": "yosoyyo_free",  # api-yosoyyo-api-ofc.onrender.com (clave gratis)
 }
 
 # (clave, nombre, dónde conseguirla, nota)
@@ -84,6 +86,12 @@ KEY_INFO: list[tuple[str, str, str, str]] = [
         "TheSportsDB (deportes)",
         "https://www.thesportsdb.com/pricing",
         "la clave de prueba pública «123» ya viene puesta; sirve para /deporte",
+    ),
+    (
+        "yosoyyo",
+        "YOSOYYO API (YouTube, redes, imágenes e IA)",
+        "https://api-yosoyyo-api-ofc.onrender.com",
+        "la clave gratis «yosoyyo_free» ya viene puesta; 100 peticiones al día",
     ),
 ]
 
@@ -168,6 +176,32 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("deporte", " <equipo>", "ficha de un equipo (TheSportsDB)"),
     ("covid", " [país]", "datos de COVID-19 de un país o del mundo"),
     ("app", " <búsqueda>", "busca apps en la App Store"),
+    ("mp3", " <enlace|búsqueda>", "descarga el audio de un vídeo de YouTube"),
+    ("mp4", " <enlace|búsqueda>", "descarga el vídeo de YouTube"),
+    ("shorts", " <enlace>", "descarga un YouTube Short"),
+    ("spotify", " <búsqueda>", "busca canciones en Spotify"),
+    ("spotifydl", " <enlace>", "descarga una canción de Spotify"),
+    ("pinterest", " <búsqueda>", "imágenes de Pinterest"),
+    ("tiktok", " <búsqueda>", "busca vídeos de TikTok"),
+    ("instagram", " <enlace>", "descarga foto o vídeo de Instagram"),
+    ("facebook", " <enlace>", "descarga un vídeo de Facebook"),
+    ("fbstalk", " <enlace>", "info de un vídeo o perfil de Facebook"),
+    ("mediafire", " <enlace>", "datos y enlace de MediaFire"),
+    ("tourl", " <url>", "sube un archivo y devuelve enlaces"),
+    ("captura", " <url>", "captura de pantalla de una web"),
+    ("ocr", " (respondiendo a una foto)", "saca el texto de una imagen"),
+    ("transcribir", " <url de audio>", "transcribe un audio a texto"),
+    ("ia", " <pregunta>", "pregúntale a la IA DeepSeek"),
+    ("tts", " <texto>", "convierte un texto en voz"),
+    ("brat", " <texto>", "imagen con el estilo brat"),
+    ("bratvid", " <texto>", "vídeo con el estilo brat"),
+    ("banner", " <texto>", "banner de bienvenida"),
+    ("cumple", " <nombre> <edad> <fecha>", "tarjeta de cumpleaños"),
+    ("cumplevid", " <nombre> <edad> <fecha>", "vídeo de cumpleaños"),
+    ("ruleta", " <op1, op2, …>", "ruleta que elige un ganador"),
+    ("nivel", " <nombre> <nivel> <xp> <máx>", "tarjeta de nivel"),
+    ("stickers", " <búsqueda>", "packs de stickers"),
+    ("apistatus", "", "consumo de la API de YOSOYYO"),
     ("echo", " <texto>", "repito tu texto"),
 ]
 
@@ -343,7 +377,15 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ["Comandos disponibles:"]
     for command, args, description in COMMANDS:
         lines.append(f"/{command}{args} — {description}")
-    await update.effective_message.reply_text(truncate("\n".join(lines)))
+    # Telegram limita cada mensaje a 4096 caracteres: lo parto por líneas.
+    chunk = ""
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 3900:
+            await update.effective_message.reply_text(chunk)
+            chunk = ""
+        chunk = f"{chunk}\n{line}" if chunk else line
+    if chunk:
+        await update.effective_message.reply_text(chunk)
 
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2592,6 +2634,721 @@ async def cmd_app(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # --------------------------------------------------------------------------
+# YOSOYYO API: descargas de YouTube, Spotify, redes sociales, imágenes
+# generadas, IA, OCR y voz. Clave gratis "yosoyyo_free" (100 al día).
+# --------------------------------------------------------------------------
+YOYO_TIMEOUT = 120
+YOYO_BASES = (
+    "https://api-yosoyyo-api-ofc.onrender.com",
+    "https://yosoyyo-api-2.onrender.com",
+)
+YOYO_MAX_UPLOAD = 45 * 1024 * 1024
+
+
+def _fetch_url(
+    url: str,
+    accept: str,
+    timeout: int,
+    method: str = "GET",
+    payload: dict | None = None,
+) -> tuple[int, bytes, str]:
+    """Petición HTTP con timeout propio que no lanza en errores 4xx/5xx."""
+    data = None
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": accept,
+        "Accept-Language": "es,en;q=0.8",
+    }
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = Request(url, data=data, method=method, headers=headers)
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            return response.status, response.read(), response.headers.get("Content-Type", "")
+    except HTTPError as exc:
+        try:
+            body = exc.read()
+            content_type = exc.headers.get("Content-Type", "") if exc.headers else ""
+            return exc.code, body, content_type
+        finally:
+            exc.close()
+
+
+def _yoyo_blocking(
+    path: str,
+    params: dict | None,
+    accept: str,
+    method: str,
+    payload: dict | None,
+    timeout: int,
+) -> tuple[bytes, str]:
+    """Prueba las dos URLs de la API y devuelve el primer 200 con cuerpo."""
+    query = dict(params or {})
+    query["apiKey"] = KEYS.get("yosoyyo") or "yosoyyo_free"
+    problems: list[str] = []
+    details: list[str] = []
+    for base in YOYO_BASES:
+        url = _build_url(base + path, query)
+        try:
+            status, body, content_type = _fetch_url(url, accept, timeout, method, payload)
+        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            problems.append(f"{base}: {exc}")
+            continue
+        if status == 200 and body:
+            return body, content_type
+        try:
+            parsed = json.loads(body.decode("utf-8", "replace"))
+            if isinstance(parsed, dict):
+                details.append(str(parsed.get("message") or parsed.get("error") or ""))
+        except ValueError:
+            pass
+        problems.append(f"{base}: HTTP {status}")
+    detail = next((item for item in details if item), "")
+    if detail:
+        raise CommandError(detail)
+    raise CommandError(
+        "La API de YOSOYYO no respondió bien. " + (problems[-1] if problems else "sin detalles")
+    )
+
+
+async def yoyo_json(
+    path: str,
+    params: dict | None = None,
+    method: str = "GET",
+    payload: dict | None = None,
+    timeout: int = YOYO_TIMEOUT,
+) -> object:
+    body, _ = await asyncio.to_thread(
+        _yoyo_blocking, path, params, "application/json", method, payload, timeout
+    )
+    try:
+        data = json.loads(body.decode("utf-8", "replace"))
+    except ValueError:
+        raise CommandError("La API de YOSOYYO devolvió una respuesta que no entiendo.")
+    if isinstance(data, dict) and data.get("status") is False:
+        raise CommandError(str(data.get("message") or "La API rechazó la petición."))
+    if isinstance(data, dict) and "result" in data:
+        return data["result"] if data["result"] is not None else {}
+    return data
+
+
+async def yoyo_bytes(
+    path: str, params: dict | None = None, timeout: int = YOYO_TIMEOUT
+) -> bytes:
+    body, content_type = await asyncio.to_thread(
+        _yoyo_blocking, path, params, "image/*,audio/*,video/*,*/*;q=0.5", "GET", None, timeout
+    )
+    if content_type.lower().startswith(("image/", "audio/", "video/")):
+        return body
+    try:
+        data = json.loads(body.decode("utf-8", "replace"))
+    except ValueError:
+        data = None
+    if isinstance(data, dict) and data.get("status"):
+        raise CommandError("La API devolvió datos en vez del archivo. Prueba otra vez.")
+    message = data.get("message") if isinstance(data, dict) else None
+    raise CommandError(str(message or "La API no devolvió ningún archivo."))
+
+
+def _download_media(url: str) -> bytes | None:
+    """Baja un archivo para subirlo al chat (None si falla o pesa demasiado)."""
+    request = Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Referer": "https://www.youtube.com/",
+            "Origin": "https://www.youtube.com",
+            "Accept": "*/*",
+        },
+    )
+    try:
+        with urlopen(request, timeout=120) as response:
+            data = response.read(YOYO_MAX_UPLOAD + 1)
+    except (HTTPError, URLError, TimeoutError, OSError):
+        return None
+    return data if len(data) <= YOYO_MAX_UPLOAD else None
+
+
+async def send_media_safely(
+    message, kind: str, url: str, filename: str, caption: str = ""
+) -> bool:
+    """Manda audio, vídeo o documento; si no puede, deja que Telegram lo baje."""
+    blob = await asyncio.to_thread(_download_media, url)
+    if blob:
+        try:
+            if kind == "audio":
+                await message.reply_audio(
+                    audio=blob, filename=filename, title=caption[:64] or None
+                )
+            elif kind == "video":
+                await message.reply_video(
+                    video=blob, filename=filename, caption=caption[:1000] or None
+                )
+            else:
+                await message.reply_document(
+                    document=blob, filename=filename, caption=caption[:1000] or None
+                )
+            return True
+        except TelegramError:
+            pass
+    try:
+        if kind == "audio":
+            await message.reply_audio(audio=url, title=caption[:64] or None)
+        elif kind == "video":
+            await message.reply_video(video=url, caption=caption[:1000] or None)
+        else:
+            await message.reply_document(document=url, caption=caption[:1000] or None)
+        return True
+    except TelegramError:
+        return False
+
+
+def find_youtube_url(text: str) -> str | None:
+    match = re.search(
+        r"((?:https?://)?(?:www\.|m\.)?(?:youtube\.com|youtu\.be)/[^\s]+)", text, re.I
+    )
+    if not match:
+        return None
+    url = match.group(1)
+    return url if url.lower().startswith("http") else "https://" + url
+
+
+async def youtube_link(target: str) -> str:
+    """Devuelve el enlace del vídeo: el que mandó el usuario o el primero de /api/youtube."""
+    link = find_youtube_url(target)
+    if link:
+        return link
+    data = await yoyo_json("/api/youtube", {"q": target})
+    items = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+    for item in items:
+        candidate = item.get("videoUrl") or item.get("url")
+        if candidate:
+            return str(candidate)
+    raise CommandError(f"No encontré ningún vídeo para «{target}».")
+
+
+def _size_bytes(value: object) -> int:
+    digits = re.sub(r"[^0-9]", "", str(value or ""))
+    return int(digits) if digits else 0
+
+
+def _resolution(value: object) -> int:
+    match = re.search(r"(\d{3,4})p", str(value or ""))
+    return int(match.group(1)) if match else 0
+
+
+def youtube_candidates(info: dict, want: str) -> list[dict]:
+    """Enlaces ordenados por preferencia: audio m4a/mp3 o MP4 desde 360p."""
+    items = info.get("results") or []
+    if want == "audio":
+        options = [
+            item
+            for item in items
+            if item.get("download") and str(item.get("type", "")).lower() == "audio"
+        ]
+        preferred = [
+            item
+            for item in options
+            if str(item.get("extension", "")).lower() in ("mp3", "m4a")
+        ]
+        return preferred + [item for item in options if item not in preferred]
+    videos = [
+        item
+        for item in items
+        if item.get("download")
+        and str(item.get("type", "")).lower() == "video"
+        and str(item.get("extension", "")).lower() == "mp4"
+    ]
+    if not videos:
+        videos = [
+            item
+            for item in items
+            if item.get("download") and str(item.get("type", "")).lower() == "video"
+        ]
+    videos.sort(
+        key=lambda item: (_resolution(item.get("quality")) or 10000, _size_bytes(item.get("fileSize")))
+    )
+    # Prefiero la calidad más baja que siga viéndose bien (360p o más).
+    good = [item for item in videos if _resolution(item.get("quality")) >= 360]
+    return good + [item for item in videos if item not in good]
+
+
+def pick_youtube_media(info: dict, want: str) -> dict | None:
+    candidates = youtube_candidates(info, want)
+    return candidates[0] if candidates else None
+
+
+async def youtube_download(update: Update, context: ContextTypes.DEFAULT_TYPE, want: str) -> None:
+    usage = "/mp3 <enlace o búsqueda>" if want == "audio" else "/mp4 <enlace o búsqueda>"
+    target = require_args(context, usage)
+    message = update.effective_message
+    status = await message.reply_text("⏳ Preparando la descarga, dame un momento…")
+    try:
+        link = await youtube_link(target)
+        info = await yoyo_json(
+            "/api/youtube/v2",
+            {"url": link, "format": "mp3" if want == "audio" else "mp4"},
+        )
+        if not isinstance(info, dict):
+            raise CommandError("La API no devolvió información de ese vídeo.")
+        candidates = youtube_candidates(info, want)
+        if not candidates:
+            raise CommandError("No hay enlaces de descarga para ese vídeo. Prueba con otro.")
+        title = str(info.get("title") or "YouTube")
+        caption = f"🎵 {title}" if want == "audio" else f"🎬 {title}"
+        sent = False
+        for chosen in candidates[:5]:
+            extension = str(chosen.get("extension") or ("m4a" if want == "audio" else "mp4"))
+            sent = await send_media_safely(
+                message, want, str(chosen["download"]), f"youtube.{extension}", caption
+            )
+            if sent:
+                break
+        if not sent:
+            raise CommandError(
+                "YouTube no dejó descargar ese vídeo en este momento (los enlaces "
+                "caducan). Prueba otra vez en unos segundos o con otro vídeo."
+            )
+    finally:
+        try:
+            await status.delete()
+        except TelegramError:
+            pass
+
+
+async def cmd_mp3(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await youtube_download(update, context, "audio")
+
+
+async def cmd_mp4(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await youtube_download(update, context, "video")
+
+
+async def cmd_shorts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    target = require_args(context, "/shorts <enlace>   ej. /shorts https://youtube.com/shorts/xxxx")
+    message = update.effective_message
+    result = await yoyo_json("/api/ytshorts", {"url": find_youtube_url(target) or target})
+    if not isinstance(result, dict):
+        raise CommandError("La API no devolvió datos de ese Short.")
+    download = result.get("downloadUrl") or result.get("download") or result.get("url")
+    if not download:
+        raise CommandError("No encontré el enlace de descarga de ese Short.")
+    title = str(result.get("title") or "Short")
+    ok = await send_media_safely(message, "video", str(download), "short.mp4", f"🎬 {title}")
+    if not ok:
+        raise CommandError(f"No pude enviar el vídeo. Enlace directo:\n{download}")
+
+
+async def cmd_spotify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = require_args(context, "/spotify <búsqueda>   ej. /spotify a thousand years")
+    result = await yoyo_json("/api/spotifysearch", {"q": query})
+    tracks = (result.get("tracks") or []) if isinstance(result, dict) else []
+    if not tracks:
+        raise CommandError(f"No encontré canciones de «{query}» en Spotify.")
+    lines = [f"🎧 Spotify: {query}", ""]
+    for track in tracks[:5]:
+        artists = track.get("artists") or []
+        names = ", ".join(str(a.get("name")) for a in artists if isinstance(a, dict))
+        duration = int(track.get("duration_ms") or 0)
+        stamp = f"{duration // 60000}:{duration // 1000 % 60:02d}" if duration else "?"
+        lines.append(f"• {track.get('name')} — {names or '?'} ({stamp})")
+        if track.get("url"):
+            lines.append(f"  🔗 {track.get('url')}")
+    await update.effective_message.reply_text(truncate("\n".join(lines)))
+
+
+async def cmd_spotifydl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    link = require_args(context, "/spotifydl <enlace de la canción>")
+    result = await yoyo_json("/api/spotifydl", {"url": link}, timeout=240)
+    download = result.get("dl") if isinstance(result, dict) else None
+    if not download:
+        raise CommandError(
+            "No pude descargar esa canción de Spotify. Prueba con otro enlace."
+        )
+    title = str(result.get("title") or "Spotify")
+    author = str(result.get("author") or "")
+    caption = f"🎵 {title}" + (f" — {author}" if author else "")
+    ok = await send_media_safely(
+        update.effective_message, "audio", str(download), "spotify.mp3", caption
+    )
+    if not ok:
+        raise CommandError(f"No pude enviar el audio. Enlace directo:\n{download}")
+
+
+async def cmd_pinterest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = require_args(context, "/pinterest <búsqueda>   ej. /pinterest zhao lusi")
+    items = await yoyo_json("/api/pinterest", {"q": query, "limite": 6})
+    if not isinstance(items, list) or not items:
+        raise CommandError(f"No encontré imágenes de «{query}» en Pinterest.")
+    message = update.effective_message
+    sent = 0
+    for item in items[:4]:
+        image = item.get("descarga") or item.get("url")
+        if not image:
+            continue
+        caption = f"📌 {item.get('titulo') or query}"
+        if item.get("autor"):
+            caption += f"\n👤 {item.get('autor')}"
+        try:
+            await message.reply_photo(photo=image, caption=caption[:1000])
+            sent += 1
+        except TelegramError:
+            continue
+    if not sent:
+        raise CommandError("Pinterest devolvió resultados, pero no pude enviar las imágenes.")
+
+
+async def cmd_tiktok(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = require_args(context, "/tiktok <búsqueda>")
+    data = await yoyo_json("/api/tiktoksearch", {"q": query})
+    items = data if isinstance(data, list) else (data.get("data") if isinstance(data, dict) else None)
+    if not items:
+        raise CommandError(f"TikTok no devolvió resultados para «{query}».")
+    lines = [f"🎵 TikTok: {query}", ""]
+    for item in items[:6]:
+        if not isinstance(item, dict):
+            continue
+        title = item.get("title") or item.get("desc") or item.get("description") or "Vídeo"
+        link = item.get("url") or item.get("videoUrl") or item.get("link")
+        author = item.get("author") or item.get("username") or ""
+        lines.append(f"• {str(title)[:80]}")
+        if author:
+            name = (
+                author.get("nickname") or author.get("unique_id")
+                if isinstance(author, dict)
+                else author
+            )
+            lines.append(f"  👤 {name}")
+        if link:
+            lines.append(f"  🔗 {link}")
+    if len(lines) == 2:
+        raise CommandError("La respuesta de TikTok no trae datos que pueda mostrar.")
+    await update.effective_message.reply_text(truncate("\n".join(lines)))
+
+
+async def cmd_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    link = require_args(context, "/instagram <enlace del post>")
+    result = await yoyo_json("/api/instagram", {"url": link})
+    media = (result.get("media") or []) if isinstance(result, dict) else []
+    if not media:
+        raise CommandError("No encontré foto o vídeo en ese enlace de Instagram.")
+    message = update.effective_message
+    title = str(result.get("title") or "Instagram")
+    caption = f"📸 {title}"
+    if result.get("username"):
+        caption += f"\n👤 {result.get('username')}"
+    sent = 0
+    for item in media[:4]:
+        url = item.get("url") if isinstance(item, dict) else None
+        if not url:
+            continue
+        try:
+            if str(item.get("type") or "").lower() == "video":
+                await message.reply_video(video=url, caption=caption[:1000])
+            else:
+                await message.reply_photo(photo=url, caption=caption[:1000])
+            sent += 1
+        except TelegramError:
+            continue
+    if not sent:
+        raise CommandError("Instagram devolvió contenido, pero Telegram no pudo abrirlo.")
+
+
+async def cmd_facebook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    link = require_args(context, "/facebook <enlace del vídeo o reel>")
+    result = await yoyo_json("/api/facebook", {"url": link})
+    if not isinstance(result, dict):
+        raise CommandError("Facebook no devolvió datos de ese enlace.")
+    links = result.get("links") or {}
+    video = (links.get("HD") or links.get("SD")) if isinstance(links, dict) else None
+    title = str(result.get("title") or "Facebook")
+    if not video:
+        raise CommandError("No encontré el vídeo en ese enlace de Facebook.")
+    try:
+        await update.effective_message.reply_video(video=video, caption=f"🎬 {title}"[:1000])
+    except TelegramError:
+        raise CommandError(f"No pude enviar el vídeo. Enlace directo:\n{video}")
+
+
+async def cmd_fbstalk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    link = require_args(context, "/fbstalk <enlace de vídeo o perfil>")
+    result = await yoyo_json("/api/fbstalk", {"url": link})
+    if not isinstance(result, dict):
+        raise CommandError("Facebook no devolvió datos de ese enlace.")
+    lines = [f"🔎 Facebook ({result.get('type') or 'contenido'})"]
+    for field in ("title", "name"):
+        if result.get(field):
+            lines.append(f"📝 {result.get(field)}")
+    author = result.get("author") or {}
+    if isinstance(author, dict) and author.get("name"):
+        lines.append(f"👤 {author.get('name')}")
+        if author.get("url"):
+            lines.append(f"  🔗 {author.get('url')}")
+    if result.get("username"):
+        lines.append(f"👤 @{result.get('username')}")
+    stats = result.get("stats") or {}
+    if isinstance(stats, dict):
+        if stats.get("likes"):
+            lines.append(f"👍 {stats.get('likes')} me gusta")
+        if stats.get("views"):
+            lines.append(f"👀 {stats.get('views')} vistas")
+    profile = result.get("authorProfile") or {}
+    if isinstance(profile, dict):
+        followers = (profile.get("stats") or {}).get("followers")
+        if followers:
+            lines.append(f"👥 {followers} seguidores")
+    if result.get("url"):
+        lines.append(f"🔗 {result.get('url')}")
+    if len(lines) == 1:
+        raise CommandError("No encontré información en ese enlace.")
+    await update.effective_message.reply_text(truncate("\n".join(lines)))
+
+
+async def cmd_mediafire(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    link = require_args(context, "/mediafire <enlace del archivo>")
+    result = await yoyo_json("/api/mediafire", {"url": link})
+    if not isinstance(result, dict) or not result.get("downloadLink"):
+        raise CommandError("No pude leer ese archivo de MediaFire.")
+    lines = [
+        f"📦 {result.get('fileName') or 'Archivo'}",
+        f"📏 {result.get('sizeText') or '?'}  •  🗂 {result.get('mimeType') or '?'}",
+        f"🔗 {result.get('downloadLink')}",
+    ]
+    await update.effective_message.reply_text(truncate("\n".join(lines)))
+
+
+async def cmd_tourl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    link = require_args(context, "/tourl <url de una imagen, audio o vídeo>")
+    if not re.match(r"^https?://", link, re.IGNORECASE):
+        raise CommandError("Mándame una URL completa que empiece por http:// o https://")
+    result = await yoyo_json("/api/tourl", method="POST", payload={"url": link}, timeout=240)
+    results = (result.get("results") or []) if isinstance(result, dict) else []
+    if not results:
+        raise CommandError("Ningún servidor de subida aceptó ese archivo.")
+    lines = ["☁️ Enlaces del archivo:"]
+    for item in results[:5]:
+        if not isinstance(item, dict):
+            continue
+        lines.append(f"• {item.get('host') or '?'}: {item.get('url')}")
+        if item.get("expires"):
+            lines.append(f"  ⏳ {item.get('expires')}")
+    await update.effective_message.reply_text(truncate("\n".join(lines)))
+
+
+async def cmd_captura(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    link = require_args(context, "/captura <url>   ej. /captura https://google.com")
+    if not re.match(r"^https?://", link, re.IGNORECASE):
+        link = "https://" + link
+    blob = await yoyo_bytes("/api/ssweb", {"url": link}, timeout=150)
+    await update.effective_message.reply_photo(photo=blob, caption=f"🖥 {link}"[:1000])
+
+
+async def cmd_ocr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    replied = getattr(message, "reply_to_message", None)
+    photo = replied.photo[-1] if replied and replied.photo else None
+    if photo is None:
+        raise CommandError("Responde a una foto con /ocr para sacarle el texto.")
+    blob = bytes(await (await photo.get_file()).download_as_bytearray())
+    encoded = base64.b64encode(blob).decode("ascii")
+    result = await yoyo_json(
+        "/api/ocr",
+        method="POST",
+        payload={"base64": encoded, "mimeType": "image/jpeg"},
+        timeout=180,
+    )
+    if isinstance(result, str):
+        text = result
+    elif isinstance(result, dict):
+        text = result.get("text") or result.get("result") or ""
+    else:
+        text = str(result or "")
+    text = str(text).strip()
+    if not text:
+        raise CommandError("No encontré texto en esa imagen.")
+    await message.reply_text(truncate(f"🔎 Texto detectado:\n\n{text}"))
+
+
+async def cmd_transcribir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    link = require_args(context, "/transcribir <url de audio>")
+    result = await yoyo_json("/api/audiotranscribe", {"url": link}, timeout=240)
+    text = result.get("text") if isinstance(result, dict) else result
+    if not text:
+        raise CommandError("No pude transcribir ese audio.")
+    language = result.get("language") if isinstance(result, dict) else None
+    header = f"🎙 Transcripción ({language}):" if language else "🎙 Transcripción:"
+    await update.effective_message.reply_text(truncate(f"{header}\n\n{text}"))
+
+
+async def cmd_ia(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    prompt = require_args(context, "/ia <pregunta>   ej. /ia explícame la fotosíntesis")
+    result = await yoyo_json("/api/deepseek", {"prompt": prompt}, timeout=180)
+    if not isinstance(result, dict):
+        raise CommandError("La IA no devolvió respuesta.")
+    answer = result.get("answer") or result.get("response")
+    if not answer:
+        raise CommandError(str(result.get("message") or "La IA no devolvió respuesta."))
+    await update.effective_message.reply_text(truncate(f"🤖 {answer}"))
+
+
+async def cmd_tts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = require_args(context, "/tts <texto>   ej. /tts hola mundo")
+    if len(text) > 500:
+        raise CommandError("El texto es muy largo; mándame menos de 500 caracteres.")
+    blob = await yoyo_bytes("/api/tts", {"text": text, "lang": "es"}, timeout=150)
+    message = update.effective_message
+    try:
+        await message.reply_audio(audio=blob, filename="voz.mp3", title=text[:64])
+    except TelegramError:
+        await message.reply_document(document=blob, filename="voz.mp3", caption=text[:200])
+
+
+async def cmd_brat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = require_args(context, "/brat <texto>")
+    blob = await yoyo_bytes("/api/brat", {"text": text, "color": "verde"})
+    await update.effective_message.reply_photo(photo=blob, caption=text[:200])
+
+
+async def cmd_bratvid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = require_args(context, "/bratvid <texto>")
+    blob = await yoyo_bytes(
+        "/api/bratvid", {"text": text, "theme": "white", "format": "mp4"}, timeout=240
+    )
+    await update.effective_message.reply_video(
+        video=blob, filename="brat.mp4", caption=text[:200]
+    )
+
+
+async def cmd_banner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = require_args(context, "/banner <texto>   ej. /banner Bienvenido Andrés")
+    params = {
+        "width": 1000,
+        "height": 500,
+        "backgroundUrl": "https://picsum.photos/1000/500",
+        "profileUrl": "https://ui-avatars.com/api/?size=200&name=" + quote(text, safe=""),
+        "profileSize": 200,
+        "profileX": 500,
+        "profileY": 200,
+        "text1": text,
+        "text1X": 500,
+        "text1Y": 350,
+    }
+    blob = await yoyo_bytes("/api/image/welcome-banner", params, timeout=180)
+    await update.effective_message.reply_photo(photo=blob, caption="🖼 Tu banner")
+
+
+def _birthday_args(context: ContextTypes.DEFAULT_TYPE, usage: str) -> tuple[str, str, str]:
+    raw = require_args(context, usage)
+    parts = raw.split(maxsplit=2)
+    if len(parts) < 3:
+        raise CommandError(f"Uso: {usage}")
+    name, age, date = parts
+    if not age.isdigit():
+        raise CommandError("La edad tiene que ser un número, ej. 25.")
+    return name, age, date
+
+
+async def cmd_cumple(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    name, age, date = _birthday_args(
+        context, "/cumple <nombre> <edad> <fecha>   ej. /cumple Juan 25 10/08/2026"
+    )
+    blob = await yoyo_bytes(
+        "/api/birthday", {"name": name, "age": age, "date": date}, timeout=180
+    )
+    await update.effective_message.reply_photo(photo=blob, caption=f"🎂 {name}, {age} años")
+
+
+async def cmd_cumplevid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    name, age, date = _birthday_args(
+        context, "/cumplevid <nombre> <edad> <fecha>   ej. /cumplevid Juan 25 10/08/2026"
+    )
+    blob = await yoyo_bytes(
+        "/api/birthdayvid", {"name": name, "age": age, "date": date}, timeout=300
+    )
+    await update.effective_message.reply_video(
+        video=blob, filename="cumple.mp4", caption=f"🎉 {name}, {age} años"
+    )
+
+
+async def cmd_ruleta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    raw = require_args(
+        context, "/ruleta <opción1, opción2, …>   ej. /ruleta pizza, sushi, tacos"
+    )
+    options = [part.strip() for part in re.split(r"[,|;]", raw) if part.strip()]
+    if len(options) < 2:
+        raise CommandError("Mándame al menos dos opciones separadas por comas.")
+    if len(options) > 100:
+        raise CommandError("La ruleta admite como máximo 100 opciones.")
+    clean = [
+        re.sub(r"[^0-9A-Za-zÁÉÍÓÚÜÑáéíóúüñ ]", "", option).strip()[:30]
+        or f"Opcion {index + 1}"
+        for index, option in enumerate(options)
+    ]
+    blob = await yoyo_bytes("/api/ruleta", {"options": ",".join(clean)}, timeout=300)
+    await update.effective_message.reply_video(
+        video=blob, filename="ruleta.mp4", caption=("🎡 " + ", ".join(clean))[:200]
+    )
+
+
+async def cmd_nivel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    raw = require_args(
+        context, "/nivel <nombre> <nivel> <xp> <xp máximo>   ej. /nivel Andrés 50 7500 10000"
+    )
+    parts = raw.split()
+    if len(parts) < 4:
+        raise CommandError("Uso: /nivel <nombre> <nivel> <xp> <xp máximo>")
+    name = " ".join(parts[:-3])
+    level, xp, max_xp = parts[-3:]
+    if not (level.isdigit() and xp.isdigit() and max_xp.isdigit()):
+        raise CommandError("Nivel, XP y XP máximo tienen que ser números.")
+    blob = await yoyo_bytes(
+        "/api/levelcard",
+        {"name": name, "level": level, "xp": xp, "maxXp": max_xp},
+        timeout=180,
+    )
+    await update.effective_message.reply_photo(
+        photo=blob, caption=f"🏅 {name} · nivel {level}"
+    )
+
+
+async def cmd_stickers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = require_args(context, "/stickers <búsqueda>   ej. /stickers anime")
+    result = await yoyo_json("/api/stickerpack", {"q": query})
+    packs = (result.get("data") or []) if isinstance(result, dict) else result
+    if not packs:
+        raise CommandError(f"No encontré packs de stickers para «{query}».")
+    lines = [f"🧩 Stickers: {query}", ""]
+    for pack in packs[:6]:
+        if not isinstance(pack, dict):
+            continue
+        lines.append(
+            f"• {pack.get('name')} — {_size_bytes(pack.get('download')):,} descargas"
+        )
+        if pack.get("url"):
+            lines.append(f"  🔗 {pack.get('url')}")
+        if pack.get("image"):
+            lines.append(f"  🖼 {pack.get('image')}")
+    await update.effective_message.reply_text(truncate("\n".join(lines)))
+
+
+async def cmd_apistatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    result = await yoyo_json("/api/auth/status")
+    if not isinstance(result, dict):
+        raise CommandError("No pude leer el estado de la API.")
+    system = result.get("system") or {}
+    user = result.get("user_data") or {}
+    lines = [
+        f"🧩 {result.get('api_name') or 'YOSOYYO API'} — {result.get('creator') or '?'}",
+        f"🟢 En línea: {'sí' if system.get('online') else 'no'}",
+        f"👤 Usuario: {user.get('username') or '?'}",
+        f"📊 Peticiones: {user.get('daily_requests_used', 0)}/{user.get('daily_limit', 0)}",
+        f"✅ Quedan: {user.get('remaining_requests', 0)}",
+    ]
+    await update.effective_message.reply_text("\n".join(lines))
+
+
+# --------------------------------------------------------------------------
 # Errores
 # --------------------------------------------------------------------------
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2785,6 +3542,32 @@ HANDLERS = {
     "deporte": cmd_deporte,
     "covid": cmd_covid,
     "app": cmd_app,
+    "mp3": cmd_mp3,
+    "mp4": cmd_mp4,
+    "shorts": cmd_shorts,
+    "spotify": cmd_spotify,
+    "spotifydl": cmd_spotifydl,
+    "pinterest": cmd_pinterest,
+    "tiktok": cmd_tiktok,
+    "instagram": cmd_instagram,
+    "facebook": cmd_facebook,
+    "fbstalk": cmd_fbstalk,
+    "mediafire": cmd_mediafire,
+    "tourl": cmd_tourl,
+    "captura": cmd_captura,
+    "ocr": cmd_ocr,
+    "transcribir": cmd_transcribir,
+    "ia": cmd_ia,
+    "tts": cmd_tts,
+    "brat": cmd_brat,
+    "bratvid": cmd_bratvid,
+    "banner": cmd_banner,
+    "cumple": cmd_cumple,
+    "cumplevid": cmd_cumplevid,
+    "ruleta": cmd_ruleta,
+    "nivel": cmd_nivel,
+    "stickers": cmd_stickers,
+    "apistatus": cmd_apistatus,
     "echo": cmd_echo,
 }
 
