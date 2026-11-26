@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import base64
 import html
 import json
 import operator
@@ -53,7 +52,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.2"
+VERSION = "3.3"
 START_TIME = time.time()
 
 # --------------------------------------------------------------------------
@@ -178,29 +177,22 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("app", " <búsqueda>", "busca apps en la App Store"),
     ("mp3", " <enlace|búsqueda>", "descarga el audio de un vídeo de YouTube"),
     ("mp4", " <enlace|búsqueda>", "descarga el vídeo de YouTube"),
-    ("shorts", " <enlace>", "descarga un YouTube Short"),
     ("spotify", " <búsqueda>", "busca canciones en Spotify"),
     ("spotifydl", " <enlace>", "descarga una canción de Spotify"),
     ("pinterest", " <búsqueda>", "imágenes de Pinterest"),
-    ("tiktok", " <búsqueda>", "busca vídeos de TikTok"),
     ("instagram", " <enlace>", "descarga foto o vídeo de Instagram"),
     ("facebook", " <enlace>", "descarga un vídeo de Facebook"),
     ("fbstalk", " <enlace>", "info de un vídeo o perfil de Facebook"),
     ("mediafire", " <enlace>", "datos y enlace de MediaFire"),
     ("tourl", " <url>", "sube un archivo y devuelve enlaces"),
     ("captura", " <url>", "captura de pantalla de una web"),
-    ("ocr", " (respondiendo a una foto)", "saca el texto de una imagen"),
-    ("transcribir", " <url de audio>", "transcribe un audio a texto"),
     ("ia", " <pregunta>", "pregúntale a la IA DeepSeek"),
     ("tts", " <texto>", "convierte un texto en voz"),
     ("brat", " <texto>", "imagen con el estilo brat"),
     ("bratvid", " <texto>", "vídeo con el estilo brat"),
     ("banner", " <texto>", "banner de bienvenida"),
     ("cumple", " <nombre> <edad> <fecha>", "tarjeta de cumpleaños"),
-    ("cumplevid", " <nombre> <edad> <fecha>", "vídeo de cumpleaños"),
-    ("ruleta", " <op1, op2, …>", "ruleta que elige un ganador"),
     ("nivel", " <nombre> <nivel> <xp> <máx>", "tarjeta de nivel"),
-    ("stickers", " <búsqueda>", "packs de stickers"),
     ("apistatus", "", "consumo de la API de YOSOYYO"),
     ("echo", " <texto>", "repito tu texto"),
 ]
@@ -2925,21 +2917,6 @@ async def cmd_mp4(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await youtube_download(update, context, "video")
 
 
-async def cmd_shorts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    target = require_args(context, "/shorts <enlace>   ej. /shorts https://youtube.com/shorts/xxxx")
-    message = update.effective_message
-    result = await yoyo_json("/api/ytshorts", {"url": find_youtube_url(target) or target})
-    if not isinstance(result, dict):
-        raise CommandError("La API no devolvió datos de ese Short.")
-    download = result.get("downloadUrl") or result.get("download") or result.get("url")
-    if not download:
-        raise CommandError("No encontré el enlace de descarga de ese Short.")
-    title = str(result.get("title") or "Short")
-    ok = await send_media_safely(message, "video", str(download), "short.mp4", f"🎬 {title}")
-    if not ok:
-        raise CommandError(f"No pude enviar el vídeo. Enlace directo:\n{download}")
-
-
 async def cmd_spotify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = require_args(context, "/spotify <búsqueda>   ej. /spotify a thousand years")
     result = await yoyo_json("/api/spotifysearch", {"q": query})
@@ -2997,34 +2974,6 @@ async def cmd_pinterest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             continue
     if not sent:
         raise CommandError("Pinterest devolvió resultados, pero no pude enviar las imágenes.")
-
-
-async def cmd_tiktok(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = require_args(context, "/tiktok <búsqueda>")
-    data = await yoyo_json("/api/tiktoksearch", {"q": query})
-    items = data if isinstance(data, list) else (data.get("data") if isinstance(data, dict) else None)
-    if not items:
-        raise CommandError(f"TikTok no devolvió resultados para «{query}».")
-    lines = [f"🎵 TikTok: {query}", ""]
-    for item in items[:6]:
-        if not isinstance(item, dict):
-            continue
-        title = item.get("title") or item.get("desc") or item.get("description") or "Vídeo"
-        link = item.get("url") or item.get("videoUrl") or item.get("link")
-        author = item.get("author") or item.get("username") or ""
-        lines.append(f"• {str(title)[:80]}")
-        if author:
-            name = (
-                author.get("nickname") or author.get("unique_id")
-                if isinstance(author, dict)
-                else author
-            )
-            lines.append(f"  👤 {name}")
-        if link:
-            lines.append(f"  🔗 {link}")
-    if len(lines) == 2:
-        raise CommandError("La respuesta de TikTok no trae datos que pueda mostrar.")
-    await update.effective_message.reply_text(truncate("\n".join(lines)))
 
 
 async def cmd_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3144,43 +3093,6 @@ async def cmd_captura(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.effective_message.reply_photo(photo=blob, caption=f"🖥 {link}"[:1000])
 
 
-async def cmd_ocr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    replied = getattr(message, "reply_to_message", None)
-    photo = replied.photo[-1] if replied and replied.photo else None
-    if photo is None:
-        raise CommandError("Responde a una foto con /ocr para sacarle el texto.")
-    blob = bytes(await (await photo.get_file()).download_as_bytearray())
-    encoded = base64.b64encode(blob).decode("ascii")
-    result = await yoyo_json(
-        "/api/ocr",
-        method="POST",
-        payload={"base64": encoded, "mimeType": "image/jpeg"},
-        timeout=180,
-    )
-    if isinstance(result, str):
-        text = result
-    elif isinstance(result, dict):
-        text = result.get("text") or result.get("result") or ""
-    else:
-        text = str(result or "")
-    text = str(text).strip()
-    if not text:
-        raise CommandError("No encontré texto en esa imagen.")
-    await message.reply_text(truncate(f"🔎 Texto detectado:\n\n{text}"))
-
-
-async def cmd_transcribir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    link = require_args(context, "/transcribir <url de audio>")
-    result = await yoyo_json("/api/audiotranscribe", {"url": link}, timeout=240)
-    text = result.get("text") if isinstance(result, dict) else result
-    if not text:
-        raise CommandError("No pude transcribir ese audio.")
-    language = result.get("language") if isinstance(result, dict) else None
-    header = f"🎙 Transcripción ({language}):" if language else "🎙 Transcripción:"
-    await update.effective_message.reply_text(truncate(f"{header}\n\n{text}"))
-
-
 async def cmd_ia(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     prompt = require_args(context, "/ia <pregunta>   ej. /ia explícame la fotosíntesis")
     result = await yoyo_json("/api/deepseek", {"prompt": prompt}, timeout=180)
@@ -3259,38 +3171,6 @@ async def cmd_cumple(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.effective_message.reply_photo(photo=blob, caption=f"🎂 {name}, {age} años")
 
 
-async def cmd_cumplevid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    name, age, date = _birthday_args(
-        context, "/cumplevid <nombre> <edad> <fecha>   ej. /cumplevid Juan 25 10/08/2026"
-    )
-    blob = await yoyo_bytes(
-        "/api/birthdayvid", {"name": name, "age": age, "date": date}, timeout=300
-    )
-    await update.effective_message.reply_video(
-        video=blob, filename="cumple.mp4", caption=f"🎉 {name}, {age} años"
-    )
-
-
-async def cmd_ruleta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    raw = require_args(
-        context, "/ruleta <opción1, opción2, …>   ej. /ruleta pizza, sushi, tacos"
-    )
-    options = [part.strip() for part in re.split(r"[,|;]", raw) if part.strip()]
-    if len(options) < 2:
-        raise CommandError("Mándame al menos dos opciones separadas por comas.")
-    if len(options) > 100:
-        raise CommandError("La ruleta admite como máximo 100 opciones.")
-    clean = [
-        re.sub(r"[^0-9A-Za-zÁÉÍÓÚÜÑáéíóúüñ ]", "", option).strip()[:30]
-        or f"Opcion {index + 1}"
-        for index, option in enumerate(options)
-    ]
-    blob = await yoyo_bytes("/api/ruleta", {"options": ",".join(clean)}, timeout=300)
-    await update.effective_message.reply_video(
-        video=blob, filename="ruleta.mp4", caption=("🎡 " + ", ".join(clean))[:200]
-    )
-
-
 async def cmd_nivel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     raw = require_args(
         context, "/nivel <nombre> <nivel> <xp> <xp máximo>   ej. /nivel Andrés 50 7500 10000"
@@ -3310,26 +3190,6 @@ async def cmd_nivel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_photo(
         photo=blob, caption=f"🏅 {name} · nivel {level}"
     )
-
-
-async def cmd_stickers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = require_args(context, "/stickers <búsqueda>   ej. /stickers anime")
-    result = await yoyo_json("/api/stickerpack", {"q": query})
-    packs = (result.get("data") or []) if isinstance(result, dict) else result
-    if not packs:
-        raise CommandError(f"No encontré packs de stickers para «{query}».")
-    lines = [f"🧩 Stickers: {query}", ""]
-    for pack in packs[:6]:
-        if not isinstance(pack, dict):
-            continue
-        lines.append(
-            f"• {pack.get('name')} — {_size_bytes(pack.get('download')):,} descargas"
-        )
-        if pack.get("url"):
-            lines.append(f"  🔗 {pack.get('url')}")
-        if pack.get("image"):
-            lines.append(f"  🖼 {pack.get('image')}")
-    await update.effective_message.reply_text(truncate("\n".join(lines)))
 
 
 async def cmd_apistatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3544,29 +3404,22 @@ HANDLERS = {
     "app": cmd_app,
     "mp3": cmd_mp3,
     "mp4": cmd_mp4,
-    "shorts": cmd_shorts,
     "spotify": cmd_spotify,
     "spotifydl": cmd_spotifydl,
     "pinterest": cmd_pinterest,
-    "tiktok": cmd_tiktok,
     "instagram": cmd_instagram,
     "facebook": cmd_facebook,
     "fbstalk": cmd_fbstalk,
     "mediafire": cmd_mediafire,
     "tourl": cmd_tourl,
     "captura": cmd_captura,
-    "ocr": cmd_ocr,
-    "transcribir": cmd_transcribir,
     "ia": cmd_ia,
     "tts": cmd_tts,
     "brat": cmd_brat,
     "bratvid": cmd_bratvid,
     "banner": cmd_banner,
     "cumple": cmd_cumple,
-    "cumplevid": cmd_cumplevid,
-    "ruleta": cmd_ruleta,
     "nivel": cmd_nivel,
-    "stickers": cmd_stickers,
     "apistatus": cmd_apistatus,
     "echo": cmd_echo,
 }
