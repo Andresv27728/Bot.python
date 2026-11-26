@@ -52,7 +52,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.0"
+VERSION = "3.1"
 START_TIME = time.time()
 
 # --------------------------------------------------------------------------
@@ -65,6 +65,7 @@ KEYS: dict[str, str] = {
     "twelvedata": "demo",  # twelvedata.com ("demo": AAPL, BTC/USD, EUR/USD)
     "giphy": "",  # developers.giphy.com (necesaria para /gif)
     "omdb": "",  # omdbapi.com (necesaria para /pelicula)
+    "sportsdb": "123",  # thesportsdb.com (clave de prueba pública y gratuita)
 }
 
 # (clave, nombre, dónde conseguirla, nota)
@@ -78,6 +79,12 @@ KEY_INFO: list[tuple[str, str, str, str]] = [
     ),
     ("giphy", "Giphy (GIFs)", "https://developers.giphy.com/dashboard/", "gratis; necesaria para /gif"),
     ("omdb", "OMDb (películas)", "https://www.omdbapi.com/apikey.aspx", "gratis por correo; necesaria para /pelicula"),
+    (
+        "sportsdb",
+        "TheSportsDB (deportes)",
+        "https://www.thesportsdb.com/pricing",
+        "la clave de prueba pública «123» ya viene puesta; sirve para /deporte",
+    ),
 ]
 
 # Auto-actualización desde el repositorio original
@@ -139,6 +146,28 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("gif", " <búsqueda>", "busca un GIF (necesita clave de Giphy)"),
     ("pelicula", " <título>", "busca una película (necesita clave de OMDb)"),
     ("claves", "", "estado de las claves de APIs"),
+    ("iss", "", "dónde está la Estación Espacial Internacional"),
+    ("arte", " <búsqueda>", "obras de arte del museo de Chicago"),
+    ("poema", " [autor]", "un poema al azar (o de un autor)"),
+    ("consejo", "", "un consejo al azar, en inglés y español"),
+    ("nombre", " <nombre>", "edad, género y país probables de un nombre"),
+    ("feriados", " <código país> [año]", "feriados oficiales (ej. /feriados CO)"),
+    ("cerveza", " <nombre>", "cervecerías de Open Brewery DB"),
+    ("producto", " <código de barras>", "info nutricional de un producto"),
+    ("musica", " <artista>", "ficha de un artista en MusicBrainz"),
+    ("letra", " <artista> - <canción>", "letra de una canción"),
+    ("color", " <hex>", "datos de un color (ej. /color 24b1e0)"),
+    ("aburrido", "", "una actividad al azar para no aburrirte"),
+    ("zorro", "", "foto de un zorro"),
+    ("dato", "", "dato curioso al azar"),
+    ("tcg", " <carta>", "carta Pokémon de TCGdex"),
+    ("f1", "", "resultados de la última carrera de F1"),
+    ("mar", " <ciudad>", "oleaje y periodo de olas"),
+    ("http", " <código>", "gato con el significado de un código HTTP"),
+    ("universidad", " <país>", "universidades de un país"),
+    ("deporte", " <equipo>", "ficha de un equipo (TheSportsDB)"),
+    ("covid", " [país]", "datos de COVID-19 de un país o del mundo"),
+    ("app", " <búsqueda>", "busca apps en la App Store"),
     ("echo", " <texto>", "repito tu texto"),
 ]
 
@@ -1888,6 +1917,681 @@ async def cmd_pelicula(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # --------------------------------------------------------------------------
+# Segunda tanda de APIs (públicas, gratis y en su mayoría sin clave)
+# --------------------------------------------------------------------------
+async def iss_report() -> str:
+    data = await http_json("https://api.wheretheiss.at/v1/satellites/25544")
+    if not isinstance(data, dict) or data.get("latitude") is None:
+        raise CommandError("No pude localizar la ISS ahora mismo.")
+    lat = float(data["latitude"])
+    lon = float(data["longitude"])
+    visibility = {
+        "daylight": "a la luz del día ☀️",
+        "eclipsed": "en la sombra de la Tierra 🌑",
+    }.get(str(data.get("visibility")), str(data.get("visibility") or "?"))
+    return "\n".join(
+        [
+            "🛰 Estación Espacial Internacional",
+            f"📍 Latitud {lat:.3f}  •  Longitud {lon:.3f}",
+            f"🚀 Altitud {float(data.get('altitude') or 0):,.0f} km  •  "
+            f"⚡ {float(data.get('velocity') or 0):,.0f} km/h",
+            f"🌗 Ahora mismo: {visibility}",
+            f"🗺 https://www.openstreetmap.org/?mlat={lat:.3f}&mlon={lon:.3f}"
+            f"#map=3/{lat:.3f}/{lon:.3f}",
+        ]
+    )
+
+
+async def cmd_iss(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(truncate(await iss_report()))
+
+
+async def art_report(query: str) -> tuple[str, str | None]:
+    data = await http_json(
+        "https://api.artic.edu/api/v1/artworks/search",
+        {
+            "q": query,
+            "limit": 1,
+            "fields": "title,artist_display,date_display,medium_display,image_id,department_title",
+        },
+    )
+    hits = (data.get("data") or []) if isinstance(data, dict) else []
+    if not hits:
+        raise CommandError(f"No encontré obras de «{query}» en el museo de Chicago.")
+    item = hits[0]
+    lines = [
+        f"🖼 {html.unescape(str(item.get('title') or 'Sin título'))}",
+        f"🎨 {html.unescape(str(item.get('artist_display') or 'Autor desconocido'))}",
+        f"📅 {item.get('date_display') or '?'}  •  "
+        f"🏛 {item.get('department_title') or '?'}",
+        f"🧱 {item.get('medium_display') or ''}".strip(),
+    ]
+    image_id = item.get("image_id")
+    image = (
+        f"https://www.artic.edu/iiif/2/{image_id}/full/843,/0/default.jpg"
+        if image_id
+        else None
+    )
+    return "\n".join(line for line in lines if line), image
+
+
+async def cmd_arte(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = require_args(context, "/arte <búsqueda>   ej. /arte girasoles")
+    text, image = await art_report(query)
+    if image:
+        await update.effective_message.reply_photo(
+            photo=image, caption=truncate(text, 900)
+        )
+    else:
+        await update.effective_message.reply_text(truncate(text))
+
+
+async def poem_report(author: str | None) -> str:
+    if author:
+        titles = await http_json(
+            f"https://poetrydb.org/author/{quote(author, safe='')}/title"
+        )
+        if not isinstance(titles, list) or not titles:
+            raise CommandError(f"No encontré poemas de «{author}».")
+        title = str(random.choice(titles).get("title") or "")
+        poems = await http_json(f"https://poetrydb.org/title/{quote(title, safe='')}")
+    else:
+        poems = await http_json("https://poetrydb.org/random/1")
+    if not isinstance(poems, list) or not poems:
+        raise CommandError("PoetryDB no devolvió ningún poema. Prueba otra vez.")
+    poem = poems[0]
+    lines = [str(line) for line in (poem.get("lines") or [])]
+    body = "\n".join(lines[:18])
+    if len(lines) > 18:
+        body += "\n…"
+    return (
+        f"📜 {poem.get('title') or 'Sin título'}\n"
+        f"✍️ {poem.get('author') or 'Anónimo'}\n\n{body}\n\n📚 poetrydb.org"
+    )
+
+
+async def cmd_poema(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    author = " ".join(context.args).strip() if context.args else None
+    await update.effective_message.reply_text(truncate(await poem_report(author)))
+
+
+async def advice_report() -> str:
+    data = await http_json(
+        "https://api.adviceslip.com/advice", {"t": int(time.time())}
+    )
+    slip = (data.get("slip") or {}) if isinstance(data, dict) else {}
+    advice = slip.get("advice")
+    if not advice:
+        raise CommandError("No pude sacar un consejo. Prueba otra vez.")
+    lines = ["💡 Consejo del día", "", f"🇬🇧 {advice}"]
+    try:
+        spanish = await translate(advice, "en", "es")
+    except (CommandError, HTTPError, URLError, ValueError):
+        spanish = ""
+    if spanish and spanish.strip().lower() != advice.strip().lower():
+        lines += ["", f"🇪🇸 {spanish}"]
+    return "\n".join(lines)
+
+
+async def cmd_consejo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(truncate(await advice_report()))
+
+
+async def name_report(name: str) -> str:
+    age, gender, nation = await asyncio.gather(
+        http_json("https://api.agify.io/", {"name": name}),
+        http_json("https://api.genderize.io/", {"name": name}),
+        http_json("https://api.nationalize.io/", {"name": name}),
+        return_exceptions=True,
+    )
+    lines = [f"🧑 Analizando el nombre «{name}»", ""]
+    if isinstance(age, dict) and age.get("age"):
+        count = age.get("count") or 0
+        lines.append(f"🎂 Edad media: {age.get('age')} años ({count:,} personas)")
+    if isinstance(gender, dict) and gender.get("gender"):
+        percent = float(gender.get("probability") or 0) * 100
+        label = "hombre" if gender.get("gender") == "male" else "mujer"
+        lines.append(f"🚻 Probablemente {label} ({percent:.0f}%)")
+    countries = (nation.get("country") or []) if isinstance(nation, dict) else []
+    if countries:
+        parts = []
+        for item in countries[:3]:
+            percent = float(item.get("probability") or 0) * 100
+            parts.append(f"{item.get('country_id')} ({percent:.0f}%)")
+        lines.append("🌍 Países probables: " + ", ".join(parts))
+    if len(lines) <= 3:
+        raise CommandError("No hay suficientes datos para ese nombre. Prueba con otro.")
+    lines += ["", "📊 Datos de agify.io, genderize.io y nationalize.io"]
+    return "\n".join(lines)
+
+
+async def cmd_nombre(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    name = require_args(context, "/nombre <nombre>   ej. /nombre andres")
+    await update.effective_message.reply_text(truncate(await name_report(name)))
+
+
+async def holidays_report(country: str, year: int | None) -> str:
+    code = country.strip().upper()
+    if not re.fullmatch(r"[A-Z]{2}", code):
+        raise CommandError(
+            "Dime el país con su código de dos letras: CO, MX, AR, CL, ES, PE…"
+        )
+    year = year or time.gmtime().tm_year
+    if not 1990 <= year <= 2100:
+        raise CommandError("El año debe estar entre 1990 y 2100.")
+    data = await http_json(
+        f"https://date.nager.at/api/v3/PublicHolidays/{year}/{code}"
+    )
+    if not isinstance(data, list) or not data:
+        raise CommandError(f"No hay feriados para «{code}» en {year}.")
+    lines = [f"📅 Feriados de {code} en {year}", ""]
+    for item in data[:15]:
+        lines.append(
+            f"• {item.get('date')} — {item.get('localName') or item.get('name')}"
+        )
+    if len(data) > 15:
+        lines.append(f"… y {len(data) - 15} más")
+    return "\n".join(lines)
+
+
+async def cmd_feriados(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args or []
+    if not args:
+        raise CommandError("/feriados <código país> [año]   ej. /feriados CO 2027")
+    year = None
+    if len(args) > 1:
+        try:
+            year = int(args[1])
+        except ValueError:
+            raise CommandError("El año debe ser un número, ej. /feriados CO 2027")
+    await update.effective_message.reply_text(
+        truncate(await holidays_report(args[0], year))
+    )
+
+
+async def brewery_report(query: str) -> str:
+    data = await http_json(
+        "https://api.openbrewerydb.org/v1/breweries",
+        {"by_name": query, "per_page": 3},
+    )
+    if not isinstance(data, list) or not data:
+        raise CommandError(f"No encontré cervecerías que se llamen «{query}».")
+    lines = [f"🍺 Cervecerías: {query}", ""]
+    for item in data:
+        place = ", ".join(
+            str(x)
+            for x in [item.get("city"), item.get("state_province"), item.get("country")]
+            if x
+        )
+        lines.append(f"• {item.get('name')} ({item.get('brewery_type') or 'tipo ?'})")
+        if place:
+            lines.append(f"  📍 {place}")
+        if item.get("website_url"):
+            lines.append(f"  🔗 {item.get('website_url')}")
+    return "\n".join(lines)
+
+
+async def cmd_cerveza(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = require_args(context, "/cerveza <nombre>   ej. /cerveza heineken")
+    await update.effective_message.reply_text(truncate(await brewery_report(query)))
+
+
+async def product_report(code: str) -> tuple[str, str | None]:
+    if not re.fullmatch(r"\d{6,14}", code):
+        raise CommandError("Mándame un código de barras numérico (6 a 14 dígitos).")
+    data = await http_json(
+        f"https://world.openfoodfacts.org/api/v2/product/{code}.json",
+        {
+            "fields": "product_name,brands,quantity,nutriscore_grade,nova_group,"
+            "ingredients_text,image_url"
+        },
+    )
+    product = data.get("product") if isinstance(data, dict) else None
+    if not product:
+        raise CommandError(f"No encontré el producto con código {code}.")
+    lines = [
+        f"🛒 {product.get('product_name') or 'Producto sin nombre'}",
+        f"🏷 {product.get('brands') or '?'}  •  ⚖️ {product.get('quantity') or '?'}",
+        f"🥗 Nutri-Score: {str(product.get('nutriscore_grade') or '?').upper()}  •  "
+        f"🏭 NOVA: {product.get('nova_group') or '?'}",
+    ]
+    ingredients = strip_html(product.get("ingredients_text") or "")
+    if ingredients:
+        lines += ["", truncate(ingredients, 600)]
+    image = product.get("image_url") or None
+    return "\n".join(lines), image
+
+
+async def cmd_producto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    code = require_args(context, "/producto <código de barras>   ej. /producto 3017624010701")
+    text, image = await product_report(code.strip())
+    if image:
+        await update.effective_message.reply_photo(
+            photo=image, caption=truncate(text, 900)
+        )
+    else:
+        await update.effective_message.reply_text(truncate(text))
+
+
+async def music_report(query: str) -> str:
+    data = await http_json(
+        "https://musicbrainz.org/ws/2/artist/",
+        {"query": f"artist:{query}", "fmt": "json", "limit": 1},
+    )
+    artists = (data.get("artists") or []) if isinstance(data, dict) else []
+    if not artists:
+        raise CommandError(f"No encontré al artista «{query}» en MusicBrainz.")
+    artist = artists[0]
+    span = artist.get("life-span") or {}
+    lines = [f"🎵 {artist.get('name')}"]
+    if artist.get("type"):
+        lines.append(f"🎤 Tipo: {artist.get('type')}")
+    if artist.get("country"):
+        lines.append(f"🌍 País: {artist.get('country')}")
+    if span.get("begin") or span.get("end"):
+        lines.append(f"📅 {span.get('begin') or '?'} → {span.get('end') or 'hoy'}")
+    if artist.get("disambiguation"):
+        lines.append(f"📝 {artist.get('disambiguation')}")
+    tags = [t.get("name") for t in (artist.get("tags") or []) if t.get("name")]
+    if tags:
+        lines.append("🏷 " + ", ".join(str(tag) for tag in tags[:5]))
+    lines.append(f"🔗 https://musicbrainz.org/artist/{artist.get('id')}")
+    return "\n".join(lines)
+
+
+async def cmd_musica(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = require_args(context, "/musica <artista>   ej. /musica bad bunny")
+    await update.effective_message.reply_text(truncate(await music_report(query)))
+
+
+async def lyrics_report(artist: str, title: str) -> str:
+    try:
+        data = await http_json(
+            f"https://api.lyrics.ovh/v1/{quote(artist, safe='')}/{quote(title, safe='')}"
+        )
+    except HTTPError as exc:
+        if exc.code == 404:
+            raise CommandError(
+                f"No encontré la letra de «{title}» de {artist}."
+            ) from exc
+        raise
+    lyrics = data.get("lyrics") if isinstance(data, dict) else None
+    if not lyrics:
+        raise CommandError(f"No encontré la letra de «{title}» de {artist}.")
+    return f"🎶 {artist} — {title}\n\n{lyrics}"
+
+
+async def cmd_letra(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    raw = require_args(
+        context, "/letra <artista> - <canción>   ej. /letra shakira - la bicicleta"
+    )
+    if " - " in raw:
+        artist, _, title = raw.partition(" - ")
+    elif "|" in raw:
+        artist, _, title = raw.partition("|")
+    else:
+        raise CommandError(
+            "Separa el artista y la canción con « - », ej. /letra shakira - la bicicleta"
+        )
+    artist, title = artist.strip(), title.strip()
+    if not artist or not title:
+        raise CommandError("Me faltó el artista o la canción.")
+    await update.effective_message.reply_text(
+        truncate(await lyrics_report(artist, title))
+    )
+
+
+async def color_report(value: str) -> str:
+    hex_value = value.strip().lstrip("#")
+    if not re.fullmatch(r"[0-9a-fA-F]{3,8}", hex_value):
+        raise CommandError("Mándame un color en hexadecimal, ej. /color 24b1e0")
+    data = await http_json("https://www.thecolorapi.com/id", {"hex": hex_value})
+    if not isinstance(data, dict) or not data.get("hex"):
+        raise CommandError("No pude leer ese color.")
+    name = (data.get("name") or {}).get("value") or "?"
+    rgb = data.get("rgb") or {}
+    hsl = data.get("hsl") or {}
+    cmyk = data.get("cmyk") or {}
+    return "\n".join(
+        [
+            f"🎨 {name}",
+            f"Hex: {(data.get('hex') or {}).get('value')}",
+            f"RGB: {rgb.get('r')}, {rgb.get('g')}, {rgb.get('b')}",
+            f"HSL: {hsl.get('h')}°, {hsl.get('s')}%, {hsl.get('l')}%",
+            f"CMYK: {cmyk.get('c')}, {cmyk.get('m')}, {cmyk.get('y')}, {cmyk.get('k')}",
+            f"🔗 https://www.thecolorapi.com/id?hex={hex_value}",
+        ]
+    )
+
+
+async def cmd_color(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    value = require_args(context, "/color <hex>   ej. /color 24b1e0")
+    await update.effective_message.reply_text(truncate(await color_report(value)))
+
+
+async def bored_report() -> str:
+    data = await http_json("https://bored-api.appbrewery.com/random")
+    if not isinstance(data, dict) or not data.get("activity"):
+        raise CommandError("No encontré nada que hacer. Irónico.")
+    lines = [
+        f"🎲 {data.get('activity')}",
+        f"🏷 Tipo: {data.get('type') or '?'}  •  👥 Participantes: "
+        f"{data.get('participants') or '?'}",
+    ]
+    if data.get("price") not in (None, ""):
+        lines.append(
+            f"💸 Precio: {data.get('price')}/5  •  💪 Esfuerzo: "
+            f"{data.get('accessibility')}/5"
+        )
+    if data.get("duration"):
+        lines.append(f"⏱ Duración: {data.get('duration')} {data.get('duration_unit') or ''}".strip())
+    return "\n".join(lines) + "\n\n(La idea llega en inglés, pero se entiende.)"
+
+
+async def cmd_aburrido(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(truncate(await bored_report()))
+
+
+async def cmd_zorro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = await http_json("https://randomfox.ca/floof/")
+    url = data.get("image") if isinstance(data, dict) else None
+    if not url:
+        raise CommandError("El zorro se escondió. Prueba otra vez.")
+    await update.effective_message.reply_photo(photo=url, caption="🦊 Un zorro")
+
+
+async def fact_report() -> str:
+    data = await http_json(
+        "https://uselessfacts.jsph.pl/api/v2/facts/random", {"language": "es"}
+    )
+    text = data.get("text") if isinstance(data, dict) else None
+    if not text:
+        raise CommandError("No encontré ningún dato. Increíble.")
+    lines = ["🤓 Dato curioso", "", text]
+    if data.get("source"):
+        lines += ["", f"Fuente: {data.get('source')}"]
+    return "\n".join(lines) + "\n\n(El dato llega en inglés.)"
+
+
+async def cmd_dato(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(truncate(await fact_report()))
+
+
+async def tcg_report(query: str) -> str:
+    cards = await http_json(
+        "https://api.tcgdex.net/v2/es/cards?name="
+        f"{quote(query)}&pagination:itemsPerPage=1"
+    )
+    if not isinstance(cards, list) or not cards:
+        raise CommandError(f"No encontré cartas Pokémon de «{query}».")
+    card = cards[0]
+    detail = await http_json(
+        f"https://api.tcgdex.net/v2/es/cards/{card.get('id')}"
+    )
+    info = detail if isinstance(detail, dict) else {}
+    lines = [f"🃏 {info.get('name') or card.get('name')}"]
+    if info.get("category"):
+        lines.append(
+            f"🏷 {info.get('category')}  •  ⭐ {info.get('rarity') or '?'}"
+        )
+    if info.get("illustrator"):
+        lines.append(f"✏️ Ilustra: {info.get('illustrator')}")
+    if info.get("hp"):
+        lines.append(f"❤️ HP: {info.get('hp')}")
+    types = info.get("types") or []
+    if types:
+        lines.append("⚡ Tipo: " + ", ".join(str(t) for t in types))
+    if info.get("description"):
+        lines += ["", truncate(str(info.get("description")), 600)]
+    return "\n".join(lines)
+
+
+async def cmd_tcg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = require_args(context, "/tcg <carta>   ej. /tcg pikachu")
+    await update.effective_message.reply_text(truncate(await tcg_report(query)))
+
+
+async def f1_report() -> str:
+    data = await http_json("https://api.jolpi.ca/ergast/f1/current/last/results.json")
+    races = (
+        (((data.get("MRData") or {}).get("RaceTable") or {}).get("Races") or [])
+        if isinstance(data, dict)
+        else []
+    )
+    if not races:
+        raise CommandError("No hay resultados de F1 disponibles ahora.")
+    race = races[0]
+    results = race.get("Results") or []
+    lines = [
+        f"🏎 F1 {race.get('season')} · Ronda {race.get('round')}",
+        f"🏁 {race.get('raceName')} — {race.get('date')}",
+        "",
+    ]
+    for item in results[:5]:
+        driver = item.get("Driver") or {}
+        team = (item.get("Constructor") or {}).get("name") or "?"
+        name = f"{driver.get('givenName') or ''} {driver.get('familyName') or ''}".strip()
+        time_value = (item.get("Time") or {}).get("time") or item.get("status") or ""
+        lines.append(f"{item.get('position')}. {name} ({team}) — {time_value}")
+    return "\n".join(lines)
+
+
+async def cmd_f1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(truncate(await f1_report()))
+
+
+async def sea_report(city: str) -> str:
+    place = await geocode(city)
+    data = await http_json(
+        "https://marine-api.open-meteo.com/v1/marine",
+        {
+            "latitude": place["latitude"],
+            "longitude": place["longitude"],
+            "daily": "wave_height_max,wave_period_max,wave_direction_dominant",
+            "timezone": "auto",
+            "forecast_days": 3,
+        },
+    )
+    daily = (data.get("daily") or {}) if isinstance(data, dict) else {}
+    dates = daily.get("time") or []
+    if not dates:
+        raise CommandError(
+            "No hay datos marinos para ese lugar (quizá está tierra adentro)."
+        )
+    heights = daily.get("wave_height_max") or []
+    periods = daily.get("wave_period_max") or []
+    directions = daily.get("wave_direction_dominant") or []
+    lines = [f"🌊 Mar en {place.get('name') or city}", ""]
+    for index, day in enumerate(dates[:3]):
+        height = heights[index] if index < len(heights) else "?"
+        period = periods[index] if index < len(periods) else "?"
+        direction = directions[index] if index < len(directions) else "?"
+        lines.append(
+            f"• {day}: olas de {height} m, periodo {period} s, dirección {direction}°"
+        )
+    return "\n".join(lines)
+
+
+async def cmd_mar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    city = require_args(context, "/mar <ciudad>   ej. /mar cartagena")
+    await update.effective_message.reply_text(truncate(await sea_report(city)))
+
+
+HTTP_STATUS_TEXT = {
+    100: "Continuar",
+    200: "OK",
+    201: "Creado",
+    204: "Sin contenido",
+    301: "Movido permanentemente",
+    302: "Encontrado",
+    304: "No modificado",
+    400: "Petición incorrecta",
+    401: "No autorizado",
+    403: "Prohibido",
+    404: "No encontrado",
+    405: "Método no permitido",
+    409: "Conflicto",
+    418: "Soy una tetera",
+    422: "Entidad no procesable",
+    429: "Demasiadas peticiones",
+    500: "Error interno del servidor",
+    501: "No implementado",
+    502: "Puerta de enlace incorrecta",
+    503: "Servicio no disponible",
+    504: "Tiempo de espera agotado",
+}
+
+
+async def cmd_http(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    raw = require_args(context, "/http <código>   ej. /http 404")
+    try:
+        code = int(raw)
+    except ValueError:
+        raise CommandError("Mándame un código HTTP numérico, ej. 404.")
+    if not 100 <= code <= 599:
+        raise CommandError("Los códigos HTTP van del 100 al 599.")
+    caption = f"🐱 HTTP {code}: {HTTP_STATUS_TEXT.get(code, 'código poco común')}"
+    try:
+        await update.effective_message.reply_photo(
+            photo=f"https://http.cat/{code}.jpg", caption=caption
+        )
+    except TelegramError:
+        await update.effective_message.reply_text(caption)
+
+
+async def university_report(country: str) -> str:
+    data = await http_json(
+        "http://universities.hipolabs.com/search", {"country": country}
+    )
+    items = data if isinstance(data, list) else []
+    if not items:
+        raise CommandError(
+            f"No encontré universidades en «{country}». Prueba con el nombre en "
+            "inglés, ej. Colombia."
+        )
+    lines = [f"🎓 Universidades: {country}", ""]
+    for item in items[:8]:
+        lines.append(f"• {item.get('name')}")
+        domains = item.get("domains") or []
+        pages = item.get("web_pages") or []
+        if domains:
+            lines.append(f"  🔗 {domains[0]}")
+        if pages:
+            lines.append(f"  🌐 {pages[0]}")
+    if len(items) > 8:
+        lines.append(f"… y {len(items) - 8} más")
+    return "\n".join(lines)
+
+
+async def cmd_universidad(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    country = require_args(context, "/universidad <país>   ej. /universidad Colombia")
+    await update.effective_message.reply_text(truncate(await university_report(country)))
+
+
+async def sport_report(query: str) -> str:
+    key = KEYS.get("sportsdb") or "123"
+    data = await http_json(
+        f"https://www.thesportsdb.com/api/v1/json/{key}/searchteams.php",
+        {"t": query},
+    )
+    teams = (data.get("teams") or []) if isinstance(data, dict) else []
+    if not teams:
+        raise CommandError(f"No encontré el equipo «{query}».")
+    team = teams[0]
+    lines = [
+        f"🏟 {team.get('strTeam')}",
+        f"⚽ {team.get('strSport') or '?'}  •  🏆 {team.get('strLeague') or '?'}",
+    ]
+    if team.get("intFormedYear"):
+        lines.append(f"📅 Fundado en {team.get('intFormedYear')}")
+    if team.get("strStadium"):
+        lines.append(f"🏟 Estadio: {team.get('strStadium')}")
+    if team.get("strLocation"):
+        lines.append(f"📍 {team.get('strLocation')}")
+    description = team.get("strDescriptionES") or team.get("strDescriptionEN") or ""
+    if description:
+        lines += ["", truncate(str(description), 700)]
+    if team.get("strWebsite"):
+        lines.append(f"\n🔗 {team.get('strWebsite')}")
+    return "\n".join(lines)
+
+
+async def cmd_deporte(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = require_args(context, "/deporte <equipo>   ej. /deporte real madrid")
+    await update.effective_message.reply_text(truncate(await sport_report(query)))
+
+
+async def covid_report(place: str) -> str:
+    if fold(place) in ("mundo", "global", "mundial", "world"):
+        data = await http_json("https://disease.sh/v3/covid-19/all")
+        title = "🌍 Mundo"
+    else:
+        try:
+            data = await http_json(
+                f"https://disease.sh/v3/covid-19/countries/{quote(place)}",
+                {"strict": "true"},
+            )
+        except HTTPError as exc:
+            if exc.code == 404:
+                raise CommandError(f"No encontré datos de «{place}».") from exc
+            raise
+        country = (data or {}).get("country") if isinstance(data, dict) else None
+        title = f"🦠 {country or place}"
+    if not isinstance(data, dict):
+        raise CommandError("No pude leer los datos de COVID-19.")
+    updated = data.get("updated")
+    stamp = ""
+    if isinstance(updated, (int, float)):
+        stamp = datetime.fromtimestamp(updated / 1000, timezone.utc).strftime(
+            "%Y-%m-%d %H:%M UTC"
+        )
+    lines = [
+        title,
+        f"🧪 Casos: {int(data.get('cases') or 0):,}",
+        f"💀 Muertes: {int(data.get('deaths') or 0):,}",
+        f"💚 Recuperados: {int(data.get('recovered') or 0):,}",
+        f"🤒 Activos: {int(data.get('active') or 0):,}",
+    ]
+    if stamp:
+        lines.append(f"🕒 Actualizado: {stamp}")
+    lines.append("\n📊 Fuente: disease.sh")
+    return "\n".join(lines)
+
+
+async def cmd_covid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    place = " ".join(context.args).strip() if context.args else "mundo"
+    await update.effective_message.reply_text(truncate(await covid_report(place)))
+
+
+async def app_report(query: str) -> str:
+    data = await http_json(
+        "https://itunes.apple.com/search",
+        {"term": query, "media": "software", "limit": 3, "country": "co"},
+    )
+    items = (data.get("results") or []) if isinstance(data, dict) else []
+    if not items:
+        raise CommandError(f"No encontré apps de «{query}» en la App Store.")
+    lines = [f"📱 Apps: {query}", ""]
+    for item in items:
+        lines.append(
+            f"• {item.get('trackName')} — {item.get('formattedPrice') or '?'}"
+        )
+        lines.append(f"  👤 {item.get('sellerName') or '?'}")
+        rating = item.get("averageUserRating")
+        if rating:
+            votes = int(item.get("userRatingCount") or 0)
+            lines.append(f"  ⭐ {float(rating):.1f} ({votes:,} votos)")
+        if item.get("trackViewUrl"):
+            lines.append(f"  🔗 {item.get('trackViewUrl')}")
+    return "\n".join(lines)
+
+
+async def cmd_app(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = require_args(context, "/app <búsqueda>   ej. /app whatsapp")
+    await update.effective_message.reply_text(truncate(await app_report(query)))
+
+
+# --------------------------------------------------------------------------
 # Errores
 # --------------------------------------------------------------------------
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2059,6 +2763,28 @@ HANDLERS = {
     "gif": cmd_gif,
     "pelicula": cmd_pelicula,
     "claves": cmd_claves,
+    "iss": cmd_iss,
+    "arte": cmd_arte,
+    "poema": cmd_poema,
+    "consejo": cmd_consejo,
+    "nombre": cmd_nombre,
+    "feriados": cmd_feriados,
+    "cerveza": cmd_cerveza,
+    "producto": cmd_producto,
+    "musica": cmd_musica,
+    "letra": cmd_letra,
+    "color": cmd_color,
+    "aburrido": cmd_aburrido,
+    "zorro": cmd_zorro,
+    "dato": cmd_dato,
+    "tcg": cmd_tcg,
+    "f1": cmd_f1,
+    "mar": cmd_mar,
+    "http": cmd_http,
+    "universidad": cmd_universidad,
+    "deporte": cmd_deporte,
+    "covid": cmd_covid,
+    "app": cmd_app,
     "echo": cmd_echo,
 }
 
