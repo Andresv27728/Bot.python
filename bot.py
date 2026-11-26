@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import base64
 import hashlib
 import html
 import json
@@ -59,7 +60,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.10"
+VERSION = "3.11"
 START_TIME = time.time()
 LAST_UPDATE_CHECK = START_TIME
 
@@ -187,6 +188,7 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("app", " <búsqueda>", "busca apps en la App Store"),
     ("mp3", " <enlace|búsqueda>", "descarga el audio de un vídeo de YouTube"),
     ("mp4", " <enlace|búsqueda>", "descarga el vídeo de YouTube"),
+    ("ytlink", " <enlace|id> [mp3|mp4]", "enlace directo de descarga de YouTube"),
     ("spotify", " <búsqueda>", "busca canciones en Spotify"),
     ("spotifydl", " <enlace>", "descarga una canción de Spotify"),
     ("ytmusic", " <búsqueda>", "busca música en YouTube Music"),
@@ -373,8 +375,7 @@ CATEGORIES: list[tuple[str, str, str, str, tuple[str, ...]]] = [
         "🎬",
         "Descargas y redes",
         "Descargas y redes sociales",
-        (
-            "mp3", "mp4", "ytmusic", "yt", "spotify", "spotifydl", "pinterest",
+                ("mp3", "mp4", "ytlink", "ytmusic", "yt", "spotify", "spotifydl", "pinterest",
             "instagram", "facebook", "fbstalk", "mediafire", "tourl", "captura",
         ),
     ),
@@ -2986,6 +2987,7 @@ def _fetch_url(
     timeout: int,
     method: str = "GET",
     payload: dict | None = None,
+    extra_headers: dict | None = None,
 ) -> tuple[int, bytes, str]:
     """Petición HTTP con timeout propio que no lanza en errores 4xx/5xx."""
     data = None
@@ -2997,6 +2999,8 @@ def _fetch_url(
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
+    if extra_headers:
+        headers.update(extra_headers)
     request = Request(url, data=data, method=method, headers=headers)
     try:
         with urlopen(request, timeout=timeout) as response:
@@ -3218,33 +3222,52 @@ async def youtube_download(update: Update, context: ContextTypes.DEFAULT_TYPE, w
     usage = "/mp3 <enlace o búsqueda>" if want == "audio" else "/mp4 <enlace o búsqueda>"
     target = require_args(context, usage)
     message = update.effective_message
+    fmt = "mp3" if want == "audio" else "mp4"
+    icon = "🎵" if want == "audio" else "🎬"
     status = await message.reply_text("⏳ Preparando la descarga, dame un momento…")
+    problems: list[str] = []
     try:
         link = await youtube_link(target)
-        info = await yoyo_json(
-            "/api/youtube/v2",
-            {"url": link, "format": "mp3" if want == "audio" else "mp4"},
-        )
-        if not isinstance(info, dict):
-            raise CommandError("La API no devolvió información de ese vídeo.")
-        candidates = youtube_candidates(info, want)
-        if not candidates:
-            raise CommandError("No hay enlaces de descarga para ese vídeo. Prueba con otro.")
-        title = str(info.get("title") or "YouTube")
-        caption = f"🎵 {title}" if want == "audio" else f"🎬 {title}"
-        sent = False
-        for chosen in candidates[:5]:
-            extension = str(chosen.get("extension") or ("m4a" if want == "audio" else "mp4"))
-            sent = await send_media_safely(
-                message, want, str(chosen["download"]), f"youtube.{extension}", caption
-            )
-            if sent:
-                break
-        if not sent:
+        try:
+            info = await yoyo_json("/api/youtube/v2", {"url": link, "format": fmt})
+            if not isinstance(info, dict):
+                raise CommandError("La API no devolvió información de ese vídeo.")
+            candidates = youtube_candidates(info, want)
+            if not candidates:
+                raise CommandError("No hay enlaces de descarga para ese vídeo. Prueba con otro.")
+            caption = f"{icon} {info.get('title') or 'YouTube'}"
+            for chosen in candidates[:5]:
+                extension = str(
+                    chosen.get("extension") or ("m4a" if want == "audio" else "mp4")
+                )
+                if await send_media_safely(
+                    message, want, str(chosen["download"]), f"youtube.{extension}", caption
+                ):
+                    return
+            problems.append("los enlaces de YOSOYYO no descargaron")
+        except CommandError as exc:
+            problems.append(str(exc))
+        video_id = youtube_video_id(link) or youtube_video_id(target)
+        if not video_id:
+            raise CommandError(problems[-1] if problems else "No pude leer ese enlace.")
+        try:
+            await status.edit_text("⏳ Probando otro proveedor de descarga…")
+        except TelegramError:
+            pass
+        try:
+            media = await tubeapi_media(video_id, fmt)
+        except CommandError as exc:
             raise CommandError(
-                "YouTube no dejó descargar ese vídeo en este momento (los enlaces "
-                "caducan). Prueba otra vez en unos segundos o con otro vídeo."
+                f"{problems[-1]}\n{exc}" if problems else str(exc)
             )
+        if await send_media_safely(
+            message, want, media["url"], f"youtube.{fmt}", f"{icon} {media['title']}"
+        ):
+            return
+        raise CommandError(
+            "No pude subir el archivo, pero este enlace directo sí funciona "
+            f"(caduca en unos minutos):\n{media['url']}"
+        )
     finally:
         try:
             await status.delete()
@@ -3258,6 +3281,135 @@ async def cmd_mp3(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_mp4(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await youtube_download(update, context, "video")
+
+
+# --------------------------------------------------------------------------
+# TubeAPI / y2mate.gs: segundo proveedor para bajar audio o vídeo de YouTube
+# Adaptado del scraper de Daps (xyrcodex):
+# https://gist.github.com/XyrexxArchive/adfa044d8e065e94e725ffe862d450bb
+# --------------------------------------------------------------------------
+TUBEAPI_KEY = "66d0abdc85f3b52ac9df11d95ebce90a"
+TUBEAPI_WORKER = "https://royal-forest-deb8.holy-breeze-fec5.workers.dev/"
+TUBEAPI_HEADERS = {"Referer": "https://tubeapi.org/", "Origin": "https://tubeapi.org"}
+YT_ID_PATTERN = re.compile(
+    r"(?:youtu\.be/|youtube\.com/(?:embed/|live/|shorts/|v/)"
+    r"|[?&]v=)([A-Za-z0-9_-]{11})"
+)
+
+
+def youtube_video_id(text: str) -> str | None:
+    """Saca el ID de 11 caracteres de un enlace de YouTube."""
+    clean = (text or "").strip()
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", clean):
+        return clean
+    match = YT_ID_PATTERN.search(clean)
+    return match.group(1) if match else None
+
+
+def _tubeapi_json(params: dict, timeout: int = 45, attempts: int = 3) -> dict:
+    """GET al worker de TubeAPI con reintentos (a veces devuelve 500 pasajero)."""
+    url = _build_url(TUBEAPI_WORKER, params)
+    status, body = 0, b""
+    data: object = None
+    for attempt in range(1, attempts + 1):
+        status, body, _ = _fetch_url(
+            url, "application/json", timeout, extra_headers=TUBEAPI_HEADERS
+        )
+        try:
+            data = json.loads(body.decode("utf-8", "replace"))
+        except ValueError:
+            data = None
+        if isinstance(data, dict) and status == 200:
+            break
+        if attempt < attempts:
+            time.sleep(1.5)
+    if not isinstance(data, dict):
+        raise CommandError(f"TubeAPI respondió HTTP {status} y no era JSON.")
+    if status != 200 or data.get("status") == "fail":
+        detail = data.get("message") or data.get("error") or str(data)[:120]
+        raise CommandError(f"TubeAPI falló (HTTP {status}): {detail}")
+    return data
+
+
+def tubeapi_media_blocking(
+    video_id: str, fmt: str, poll_seconds: int = 4, max_polls: int = 30
+) -> dict:
+    """Pide la conversión y espera hasta que TubeAPI devuelva el archivo final."""
+    started = time.time()
+    init = _tubeapi_json(
+        {
+            "v": video_id,
+            "f": fmt,
+            "e": "i",
+            "api_key": TUBEAPI_KEY,
+            "_": int(started * 1000),
+        }
+    )
+    status_url = str(init.get("statusUrl") or "")
+    if not status_url:
+        raise CommandError("TubeAPI no devolvió la URL de progreso.")
+    encoded = base64.b64encode(status_url.encode()).decode()
+    title = str(init.get("title") or "YouTube")
+    duration = int(init.get("duration") or 0)
+    for _ in range(max_polls):
+        data = _tubeapi_json(
+            {
+                "u": encoded,
+                "e": "p",
+                "api_key": TUBEAPI_KEY,
+                "_": int(time.time() * 1000),
+            }
+        )
+        if data.get("status") == "completed" and data.get("downloadUrl"):
+            return {
+                "url": str(data["downloadUrl"]),
+                "title": str(data.get("title") or title),
+                "duration": int(data.get("duration") or duration),
+                "seconds": int(time.time() - started),
+            }
+        time.sleep(poll_seconds)
+    raise CommandError("TubeAPI tardó demasiado en convertir ese vídeo.")
+
+
+async def tubeapi_media(video_id: str, fmt: str) -> dict:
+    return await asyncio.to_thread(tubeapi_media_blocking, video_id, fmt)
+
+
+async def cmd_ytlink(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = " ".join(context.args).strip() if context.args else ""
+    if not args:
+        raise CommandError(
+            "Uso: /ytlink <enlace|id> [mp3|mp4]   "
+            "ej. /ytlink https://youtu.be/PxEBw1GWEY0 mp3"
+        )
+    parts = args.split()
+    fmt = "mp3"
+    if len(parts) > 1 and parts[-1].lower() in ("mp3", "mp4"):
+        fmt = parts[-1].lower()
+        parts = parts[:-1]
+    video_id = youtube_video_id(" ".join(parts))
+    if not video_id:
+        raise CommandError("Necesito un enlace o un ID de YouTube (11 caracteres).")
+    message = update.effective_message
+    status = await message.reply_text("⏳ Preparando el enlace directo…")
+    try:
+        media = await tubeapi_media(video_id, fmt)
+    finally:
+        try:
+            await status.delete()
+        except TelegramError:
+            pass
+    duration = int(media.get("duration") or 0)
+    stamp = f"{duration // 60}:{duration % 60:02d}" if duration else "?"
+    lines = [
+        f"🔗 {media['title']}",
+        f"⏱ {stamp} · {fmt.upper()} · listo en {media.get('seconds', 0)} s",
+        "",
+        media["url"],
+        "",
+        "El enlace caduca en unos minutos: ábrelo o guárdalo pronto.",
+    ]
+    await message.reply_text(truncate("\n".join(lines)))
 
 
 async def cmd_spotify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3949,6 +4101,7 @@ HANDLERS = {
     "app": cmd_app,
     "mp3": cmd_mp3,
     "mp4": cmd_mp4,
+    "ytlink": cmd_ytlink,
     "spotify": cmd_spotify,
     "spotifydl": cmd_spotifydl,
     "ytmusic": cmd_ytmusic,
