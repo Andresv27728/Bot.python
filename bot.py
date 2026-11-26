@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
 import html
 import json
 import operator
@@ -36,6 +37,7 @@ import re
 import sys
 import time
 import unicodedata
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -57,7 +59,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.8"
+VERSION = "3.9"
 START_TIME = time.time()
 
 # --------------------------------------------------------------------------
@@ -195,6 +197,7 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("tourl", " <url>", "sube un archivo y devuelve enlaces"),
     ("captura", " <url>", "captura de pantalla de una web"),
     ("ia", " <pregunta>", "pregúntale a la IA DeepSeek"),
+    ("deepai", " <pregunta>", "chatea con la IA de DeepAI"),
     ("tts", " <texto>", "convierte un texto en voz"),
     ("brat", " <texto>", "imagen con el estilo brat"),
     ("bratvid", " <texto>", "vídeo con el estilo brat"),
@@ -429,7 +432,7 @@ CATEGORIES: list[tuple[str, str, str, str, tuple[str, ...]]] = [
         "🤖",
         "IA y herramientas",
         "IA y herramientas",
-        ("ia", "calc", "claves", "apistatus", "publicar"),
+        ("ia", "deepai", "calc", "claves", "apistatus", "publicar"),
     ),
     (
         "bot",
@@ -3628,6 +3631,83 @@ async def cmd_ytmusic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 # --------------------------------------------------------------------------
+# DeepAI Chat (deepai.org/chat)
+# Adaptado del scraper de Vamz Spectre (VamxAPI):
+# https://code.vamxapi.my.id/snippet/raw/deepai-chat
+# --------------------------------------------------------------------------
+DEEPAI_URL = "https://api.deepai.org/hacking_is_a_serious_crime"
+DEEPAI_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+
+def deepai_key() -> str:
+    """Clave de prueba tipo tryit-<rand>-<hash>, como la que genera la web."""
+    rand = random.randint(10**11, 10**12 - 1)
+    return f"tryit-{rand}-{hashlib.md5(f'{DEEPAI_UA}{rand}'.encode()).hexdigest()}"
+
+
+def _deepai_chat_blocking(prompt: str, timeout: int = 90, language: str = "es") -> str:
+    """POST multipart al chat de DeepAI; devuelve el texto de la respuesta."""
+    boundary = f"----botpy{uuid.uuid4().hex}"
+    fields = {
+        "chat_style": "chat",
+        "language": language,
+        "chatHistory": json.dumps(
+            [{"role": "user", "content": prompt}], ensure_ascii=False
+        ),
+        "model": "standard",
+        "session_uuid": str(uuid.uuid4()),
+        "hacker_is_stinky": "very_stinky",
+    }
+    body = "".join(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n'
+        f"{value}\r\n"
+        for name, value in fields.items()
+    ) + f"--{boundary}--\r\n"
+    request = Request(
+        DEEPAI_URL,
+        data=body.encode("utf-8"),
+        method="POST",
+        headers={
+            "api-key": deepai_key(),
+            "User-Agent": DEEPAI_UA,
+            "Origin": "https://deepai.org",
+            "Referer": "https://deepai.org/chat",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Accept": "text/plain,*/*",
+        },
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            text = response.read().decode("utf-8", "replace").strip()
+    except HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", "replace").strip()[:200]
+        finally:
+            exc.close()
+        raise CommandError(f"DeepAI respondió HTTP {exc.code}. {detail}".strip())
+    except (URLError, TimeoutError, OSError) as exc:
+        raise CommandError(f"No pude contactar con DeepAI: {exc}")
+    if not text:
+        raise CommandError("DeepAI no devolvió ninguna respuesta.")
+    return text
+
+
+async def deepai_chat(prompt: str) -> str:
+    return await asyncio.to_thread(_deepai_chat_blocking, prompt)
+
+
+async def cmd_deepai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    prompt = require_args(
+        context, "/deepai <pregunta>   ej. /deepai explícame los agujeros negros"
+    )
+    answer = await deepai_chat(prompt)
+    await update.effective_message.reply_text(truncate(f"🌀 {answer}"))
+
+
+# --------------------------------------------------------------------------
 # Errores
 # --------------------------------------------------------------------------
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3836,6 +3916,7 @@ HANDLERS = {
     "tourl": cmd_tourl,
     "captura": cmd_captura,
     "ia": cmd_ia,
+    "deepai": cmd_deepai,
     "tts": cmd_tts,
     "brat": cmd_brat,
     "bratvid": cmd_bratvid,
