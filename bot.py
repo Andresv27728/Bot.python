@@ -61,7 +61,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.18"
+VERSION = "3.19"
 START_TIME = time.time()
 LAST_UPDATE_CHECK = START_TIME
 
@@ -629,7 +629,7 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = [
         "🏓 pong",
         f"⚡ Latencia: {latency:.0f} ms",
-        f"⏱ Hora del servidor: {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC",
+        f"⏱ Activo desde hace {uptime_text()}",
     ]
     try:
         await sent.edit_text("\n".join(lines))
@@ -655,6 +655,17 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"chat_id: {chat.id if chat else 'desconocido'}\n"
         f"tipo de chat: {chat.type if chat else 'desconocido'}"
     )
+
+
+def uptime_text() -> str:
+    """Tiempo que lleva el bot encendido, en formato legible."""
+    seconds = int(time.time() - START_TIME)
+    days, rest = divmod(seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes, secs = divmod(rest, 60)
+    if days:
+        return f"{days}d {hours}h {minutes}m {secs}s"
+    return f"{hours}h {minutes}m {secs}s"
 
 
 def next_check_in() -> int:
@@ -730,14 +741,9 @@ async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    seconds = int(time.time() - START_TIME)
-    days, rest = divmod(seconds, 86400)
-    hours, rest = divmod(rest, 3600)
-    minutes, secs = divmod(rest, 60)
-    uptime = f"{days}d {hours}h {minutes}m {secs}s" if days else f"{hours}h {minutes}m {secs}s"
     await update.effective_message.reply_text(
         f"🤖 Bot v{VERSION}\n"
-        f"⏱ Encendido desde hace {uptime}\n"
+        f"⏱ Encendido desde hace {uptime_text()}\n"
         f"🧩 Comandos: {len(COMMANDS)}\n"
         f"🐍 Python {sys.version.split()[0]}\n"
         f"📦 python-telegram-bot {telegram.__version__}\n"
