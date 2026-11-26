@@ -61,7 +61,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.17"
+VERSION = "3.18"
 START_TIME = time.time()
 LAST_UPDATE_CHECK = START_TIME
 
@@ -623,7 +623,18 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text("🏓 pong")
+    started = time.perf_counter()
+    sent = await update.effective_message.reply_text("🏓 …")
+    latency = (time.perf_counter() - started) * 1000
+    lines = [
+        "🏓 pong",
+        f"⚡ Latencia: {latency:.0f} ms",
+        f"⏱ Hora del servidor: {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC",
+    ]
+    try:
+        await sent.edit_text("\n".join(lines))
+    except TelegramError:
+        await update.effective_message.reply_text("\n".join(lines))
 
 
 async def cmd_echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
