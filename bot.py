@@ -57,7 +57,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.6"
+VERSION = "3.7"
 START_TIME = time.time()
 
 # --------------------------------------------------------------------------
@@ -118,6 +118,7 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("ping", "", "comprueba que sigo vivo"),
     ("info", "", "tus datos de Telegram"),
     ("estado", "", "estado y versión del bot"),
+    ("version", "", "compara tu versión con la de GitHub"),
     ("calc", " <operación>", "calculadora (ej. 2+2*3)"),
     ("clima", " <ciudad>", "clima y pronóstico de 3 días"),
     ("noticias", "", "titulares de BBC Mundo y El País"),
@@ -435,7 +436,7 @@ CATEGORIES: list[tuple[str, str, str, str, tuple[str, ...]]] = [
         "⚙️",
         "El bot",
         "El bot",
-        ("menu", "start", "help", "ping", "info", "estado", "echo"),
+        ("menu", "start", "help", "ping", "info", "estado", "version", "echo"),
     ),
 ]
 
@@ -637,6 +638,61 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"chat_id: {chat.id if chat else 'desconocido'}\n"
         f"tipo de chat: {chat.type if chat else 'desconocido'}"
     )
+
+
+def _version_tuple(value: str) -> tuple[int, ...]:
+    """"3.10" se convierte en (3, 10) para poder comparar versiones."""
+    numbers = re.findall(r"\d+", value)
+    return tuple(int(number) for number in numbers) if numbers else (0,)
+
+
+def _remote_version_info() -> tuple[str | None, bool]:
+    """Versión publicada en GitHub y si el archivo es idéntico al de aquí."""
+    source = fetch_latest_source()
+    if source is None:
+        return None, False
+    match = re.search(r'^VERSION\s*=\s*"([^"]+)"', source, re.MULTILINE)
+    remote = match.group(1) if match else None
+    try:
+        local = SELF_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return remote, False
+    return remote, source == local
+
+
+async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    remote, identical = await asyncio.to_thread(_remote_version_info)
+    if not remote:
+        raise CommandError(
+            "No pude leer la versión de GitHub.\n"
+            f"Tu versión local es v{VERSION}.\n{UPDATE_URL}"
+        )
+    local = _version_tuple(VERSION)
+    latest = _version_tuple(remote)
+    if latest > local:
+        headline = f"⬆️ Hay una versión nueva: v{remote}. Tú tienes v{VERSION}."
+        advice = (
+            "El auto-update la instala en el próximo chequeo (cada "
+            f"{UPDATE_INTERVAL_SECONDS // 60} min). Si no llega, reinicia el bot."
+        )
+    elif latest < local:
+        headline = f"🧪 Vas por delante: v{VERSION} > v{remote} de GitHub."
+        advice = "GitHub todavía no tiene ese cambio subido."
+    else:
+        headline = f"✅ Estás actualizado: v{VERSION} es la última."
+        advice = f"Auto-update activo cada {UPDATE_INTERVAL_SECONDS // 60} min."
+    lines = [
+        "🔎 VERSIÓN DEL BOT",
+        "",
+        headline,
+        f"Local: v{VERSION} · GitHub: v{remote}",
+        f"Archivo igual al de GitHub: {'sí' if identical else 'no'}",
+        f"Comandos: {len(COMMANDS)}",
+        "",
+        advice,
+        f"Origen: {UPDATE_URL}",
+    ]
+    await update.effective_message.reply_text("\n".join(lines))
 
 
 async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3672,6 +3728,7 @@ HANDLERS = {
     "ping": cmd_ping,
     "info": cmd_info,
     "estado": cmd_estado,
+    "version": cmd_version,
     "calc": cmd_calc,
     "clima": cmd_clima,
     "noticias": cmd_noticias,
