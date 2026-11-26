@@ -61,7 +61,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.16"
+VERSION = "3.17"
 START_TIME = time.time()
 LAST_UPDATE_CHECK = START_TIME
 
@@ -1135,9 +1135,17 @@ async def cmd_sismos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # Pokémon (PokeAPI, sin key)
 # --------------------------------------------------------------------------
 async def pokemon_report(name: str) -> tuple[str, str | None]:
-    data = await http_json(
-        f"https://pokeapi.co/api/v2/pokemon/{quote(name.strip().lower(), safe='')}"
-    )
+    try:
+        data = await http_json(
+            "https://pokeapi.co/api/v2/pokemon/"
+            + quote(name.strip().lower().replace(" ", "-"), safe="")
+        )
+    except HTTPError as exc:
+        if exc.code == 404:
+            raise CommandError(f"No encontré el Pokémon «{name}». Revisa cómo se escribe.")
+        raise CommandError(f"PokeAPI respondió HTTP {exc.code}. Prueba otra vez en un rato.")
+    except (URLError, TimeoutError, OSError) as exc:
+        raise CommandError(f"No pude contactar con PokeAPI: {exc}")
     if not isinstance(data, dict) or "name" not in data:
         raise CommandError(f"No encontré el Pokémon «{name}».")
     types = ", ".join(
@@ -1147,7 +1155,7 @@ async def pokemon_report(name: str) -> tuple[str, str | None]:
     height = (data.get("height") or 0) / 10
     weight = (data.get("weight") or 0) / 10
     lines = [
-        f"⚡ #{data.get('id')} {str(data.get('name')).capitalize()}",
+        f"⚡ #{data.get('id')} {str(data.get('name')).replace('-', ' ').title()}",
         f"🧬 Tipo: {types or '?'}",
         f"📏 {height:.1f} m  •  ⚖️ {weight:.1f} kg",
         f"❤️ PS {stats.get('hp', '?')}  •  ⚔️ ATQ {stats.get('attack', '?')}  •  "
