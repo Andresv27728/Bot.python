@@ -30,6 +30,7 @@ import asyncio
 import base64
 import hashlib
 import html
+import io
 import json
 import operator
 import os
@@ -60,7 +61,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.11"
+VERSION = "3.12"
 START_TIME = time.time()
 LAST_UPDATE_CHECK = START_TIME
 
@@ -205,6 +206,7 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("brat", " <texto>", "imagen con el estilo brat"),
     ("bratvid", " <texto>", "vídeo con el estilo brat"),
     ("banner", " <texto>", "banner de bienvenida"),
+    ("qwindows", " <texto>", "meme de Windows Media Player con tu texto"),
     ("cumple", " <nombre> <edad> <fecha>", "tarjeta de cumpleaños"),
     ("nivel", " <nombre> <nivel> <xp> <máx>", "tarjeta de nivel"),
     ("apistatus", "", "consumo de la API de YOSOYYO"),
@@ -408,8 +410,8 @@ CATEGORIES: list[tuple[str, str, str, str, tuple[str, ...]]] = [
         "Imágenes",
         "Imágenes y generadores",
         (
-            "brat", "bratvid", "banner", "nivel", "cumple", "nasa", "arte", "gif",
-            "perro", "gato", "zorro",
+            "brat", "bratvid", "banner", "qwindows", "nivel", "cumple", "nasa",
+            "arte", "gif", "perro", "gato", "zorro",
         ),
     ),
     (
@@ -3801,6 +3803,199 @@ async def cmd_ytmusic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 # --------------------------------------------------------------------------
+# Meme "Windows Media Player" (quote-windows)
+# Adaptado del plugin de JavraaSaturn (JavraTools):
+# https://code.javraxaturn.my.id/code/quote-windows
+# --------------------------------------------------------------------------
+QWIN_TEMPLATE_URL = "https://files.catbox.moe/7otzp2.jpg"
+QWIN_FONT_URLS = (
+    "https://cdn.jsdelivr.net/gh/rsms/inter@v3.19/docs/font-files/Inter-Bold.otf",
+    "https://raw.githubusercontent.com/rsms/inter/v3.19/docs/font-files/Inter-Bold.otf",
+)
+QWIN_DIR = SELF_PATH.parent / "qwindows"
+QWIN_BASE_SIZE = 148
+QWIN_INK_W = 451
+QWIN_BASELINE = 715
+QWIN_CX = 351
+QWIN_COLOR = (28, 29, 33)
+QWIN_MAX_WIDTH = 500
+QWIN_BOX_TOP = 390
+QWIN_BOX_BOTTOM = 1010
+QWIN_MIN_SIZE = 34
+QWIN_MAX_LINES = 6
+QWIN_MAX_CHARS = 300
+QWIN_COOLDOWN = 5
+_QWIN_LAST: dict[int, float] = {}
+_QWIN_FONTS: dict[int, object] = {}
+
+
+def _qwin_asset(name: str, urls: tuple[str, ...], minimum: int) -> Path:
+    """Plantilla y fuente: se descargan una vez y quedan cacheadas en disco."""
+    path = QWIN_DIR / name
+    if path.exists() and path.stat().st_size >= minimum:
+        return path
+    QWIN_DIR.mkdir(parents=True, exist_ok=True)
+    problems: list[str] = []
+    for url in urls:
+        try:
+            status, body, _ = _fetch_url(url, "*/*", 45)
+        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            problems.append(f"{url}: {exc}")
+            continue
+        if status == 200 and len(body) >= minimum:
+            path.write_bytes(body)
+            return path
+        problems.append(f"{url}: HTTP {status}")
+    raise CommandError(
+        "No pude descargar los archivos del meme de Windows. "
+        + (problems[-1] if problems else "sin detalles")
+    )
+
+
+def qwindows_image(text: str) -> bytes:
+    """Render del meme (1123x1401) con el texto en el hueco blanco de la izquierda."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        raise CommandError(
+            "Falta Pillow en el servidor. Ejecuta: pip install Pillow "
+            "(ya está en requirements.txt)."
+        )
+
+    template = _qwin_asset("template.jpg", (QWIN_TEMPLATE_URL,), 10_000)
+    font_path = _qwin_asset("Inter-Bold.otf", QWIN_FONT_URLS, 20_000)
+
+    def load_font(px: int):
+        cached = _QWIN_FONTS.get(px)
+        if cached is None:
+            cached = ImageFont.truetype(str(font_path), px)
+            _QWIN_FONTS[px] = cached
+        return cached
+
+    def ink(font, value: str) -> float:
+        box = font.getbbox(value)
+        return max(0.0, float(box[2] - box[0]))
+
+    def wrap(font, value: str) -> list[str]:
+        lines: list[str] = []
+        for paragraph in value.split("\n"):
+            words = paragraph.split()
+            if not words:
+                lines.append("")
+                continue
+            line = ""
+            for word in words:
+                test = f"{line} {word}" if line else word
+                if ink(font, test) <= QWIN_MAX_WIDTH:
+                    line = test
+                    continue
+                if line:
+                    lines.append(line)
+                    line = ""
+                if ink(font, word) <= QWIN_MAX_WIDTH:
+                    line = word
+                    continue
+                piece = ""
+                for char in word:
+                    if piece and ink(font, piece + char) > QWIN_MAX_WIDTH:
+                        lines.append(piece)
+                        piece = char
+                    else:
+                        piece += char
+                line = piece
+            if line:
+                lines.append(line)
+        return lines
+
+    def layout(value: str, base: int) -> tuple[int, list[str], int]:
+        paragraphs = value.split("\n")
+        for size in range(base, round(base * 0.5) - 1, -2):
+            font = load_font(size)
+            if all(ink(font, p.strip()) <= QWIN_MAX_WIDTH for p in paragraphs):
+                line_height = round(size * 1.16)
+                count = len(paragraphs)
+                first_top = QWIN_BASELINE - ((count - 1) / 2) * line_height - size * 0.74
+                last_bottom = QWIN_BASELINE + ((count - 1) / 2) * line_height + size * 0.22
+                if (
+                    count <= QWIN_MAX_LINES
+                    and first_top >= QWIN_BOX_TOP
+                    and last_bottom <= QWIN_BOX_BOTTOM
+                ):
+                    return size, [p.strip() for p in paragraphs], line_height
+        for size in range(base, QWIN_MIN_SIZE - 1, -2):
+            font = load_font(size)
+            lines = wrap(font, value)
+            line_height = round(size * 1.16)
+            count = len(lines)
+            if count > QWIN_MAX_LINES:
+                continue
+            first_top = QWIN_BASELINE - ((count - 1) / 2) * line_height - size * 0.74
+            last_bottom = QWIN_BASELINE + ((count - 1) / 2) * line_height + size * 0.22
+            if first_top >= QWIN_BOX_TOP and last_bottom <= QWIN_BOX_BOTTOM:
+                return size, lines, line_height
+        font = load_font(QWIN_MIN_SIZE)
+        return (
+            QWIN_MIN_SIZE,
+            wrap(font, value)[:QWIN_MAX_LINES],
+            round(QWIN_MIN_SIZE * 1.16),
+        )
+
+    image = Image.open(io.BytesIO(template.read_bytes())).convert("RGB")
+    draw = ImageDraw.Draw(image)
+    calibrated = max(
+        0.8, min(1.15, QWIN_INK_W / ink(load_font(QWIN_BASE_SIZE), "whaty"))
+    )
+    size, lines, line_height = layout(text, round(QWIN_BASE_SIZE * calibrated))
+    font = load_font(size)
+    count = len(lines)
+    for index, line in enumerate(lines):
+        y = round(QWIN_BASELINE + (index - (count - 1) / 2) * line_height)
+        draw.text((QWIN_CX, y), line, font=font, fill=QWIN_COLOR, anchor="ms")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+async def cmd_qwindows(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    text = " ".join(context.args).strip() if context.args else ""
+    if not text:
+        replied = getattr(message, "reply_to_message", None)
+        if replied is not None:
+            text = str(replied.text or replied.caption or "").strip()
+    if not text or text.lower() in ("help", "ayuda", "?"):
+        raise CommandError(
+            "Uso: /qwindows <texto>   ej. /qwindows Hola mundo\n"
+            "También puedes responder a un mensaje de texto y escribir /qwindows."
+        )
+    if len(text) > QWIN_MAX_CHARS:
+        raise CommandError(
+            f"El texto es muy largo: {len(text)} caracteres (máximo {QWIN_MAX_CHARS})."
+        )
+    user = update.effective_user
+    uid = int(getattr(user, "id", 0) or 0)
+    wait = QWIN_COOLDOWN - (time.time() - _QWIN_LAST.get(uid, 0.0))
+    if wait > 0:
+        raise CommandError(f"⏳ Espera {int(wait) + 1} segundos antes de otro meme.")
+    _QWIN_LAST[uid] = time.time()
+    status = await message.reply_text("🪟 Preparando el meme…")
+    try:
+        blob = await asyncio.to_thread(qwindows_image, text)
+    finally:
+        try:
+            await status.delete()
+        except TelegramError:
+            pass
+    caption = truncate(text, 200)
+    try:
+        await message.reply_photo(photo=blob, caption=caption)
+    except TelegramError:
+        await message.reply_document(
+            document=blob, filename="qwindows.png", caption=caption
+        )
+
+
+# --------------------------------------------------------------------------
 # DeepAI Chat (deepai.org/chat)
 # Adaptado del scraper de Vamz Spectre (VamxAPI):
 # https://code.vamxapi.my.id/snippet/raw/deepai-chat
@@ -4118,6 +4313,7 @@ HANDLERS = {
     "brat": cmd_brat,
     "bratvid": cmd_bratvid,
     "banner": cmd_banner,
+    "qwindows": cmd_qwindows,
     "cumple": cmd_cumple,
     "nivel": cmd_nivel,
     "apistatus": cmd_apistatus,
