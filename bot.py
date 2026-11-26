@@ -57,7 +57,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.5"
+VERSION = "3.6"
 START_TIME = time.time()
 
 # --------------------------------------------------------------------------
@@ -440,6 +440,19 @@ CATEGORIES: list[tuple[str, str, str, str, tuple[str, ...]]] = [
 ]
 
 
+def _needs_arguments(spec: str) -> bool:
+    """True si el comando tiene algún argumento obligatorio (<...>)."""
+    return any(part.startswith("<") for part in spec.split())
+
+
+# Comandos que funcionan sin argumentos: se pueden lanzar desde un botón.
+RUNNABLE = {
+    command
+    for command, args, _ in COMMANDS
+    if not _needs_arguments(args) and command not in ("start", "help", "menu", "echo")
+}
+
+
 def _command_line(name: str) -> str:
     """Línea de ayuda de un comando, con sus argumentos."""
     for command, args, description in COMMANDS:
@@ -465,15 +478,26 @@ def build_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def category_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+def category_keyboard(key: str) -> InlineKeyboardMarkup:
+    """Volver, al azar y un botón ▶️ por cada comando que no pide datos."""
+    commands = next((cmds for cat_key, _, _, _, cmds in CATEGORIES if cat_key == key), ())
+    rows: list[list[InlineKeyboardButton]] = [
         [
-            [
-                InlineKeyboardButton("⬅️ Menú", callback_data="m:h"),
-                InlineKeyboardButton("🎲 Al azar", callback_data="m:r"),
-            ]
+            InlineKeyboardButton("⬅️ Menú", callback_data="m:h"),
+            InlineKeyboardButton("🎲 Al azar", callback_data="m:r"),
         ]
-    )
+    ]
+    row: list[InlineKeyboardButton] = []
+    for name in commands:
+        if name not in RUNNABLE:
+            continue
+        row.append(InlineKeyboardButton(f"▶️ /{name}", callback_data=f"m:x:{name}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
 
 
 def menu_text() -> str:
@@ -498,6 +522,8 @@ def category_text(key: str) -> str:
             continue
         lines = [f"{emoji} {title.upper()} · {len(commands)} comandos", ""]
         lines.extend(_command_line(name) for name in commands)
+        if any(name in RUNNABLE for name in commands):
+            lines += ["", "▶️ Toca un botón para ejecutarlo aquí mismo."]
         return truncate("\n".join(lines))
     return "No encontré esa categoría. Abre /menu para ver las que hay."
 
@@ -508,7 +534,7 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         for key, _, _, title, _ in CATEGORIES:
             if args in (key, title.lower()) or title.lower().startswith(args):
                 await update.effective_message.reply_text(
-                    category_text(key), reply_markup=category_keyboard()
+                    category_text(key), reply_markup=category_keyboard(key)
                 )
                 return
         raise CommandError(f"No conozco la categoría «{args}». Abre /menu para verlas.")
@@ -526,9 +552,28 @@ async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         options = [command for command in options if command not in ("start", "help", "menu")]
         await query.answer(f"🎲 {_command_line(random.choice(options))}", show_alert=True)
         return
+    if data.startswith("m:x:"):
+        command = data[4:]
+        handler = HANDLERS.get(command)
+        if command not in RUNNABLE or handler is None:
+            await query.answer(
+                f"/{command} necesita datos: escríbelo con sus argumentos.", show_alert=True
+            )
+            return
+        await query.answer(f"▶️ Ejecutando /{command}…")
+        message = update.effective_message
+        context.args = []
+        try:
+            await handler(update, context)
+        except CommandError as exc:
+            await message.reply_text(f"⚠️ {exc}")
+        except Exception as exc:  # cualquier fallo raro se avisa en el chat
+            await message.reply_text(f"⚠️ /{command} falló: {exc}")
+        return
     await query.answer()
     if data.startswith("m:c:"):
-        text, markup = category_text(data[4:]), category_keyboard()
+        key = data[4:]
+        text, markup = category_text(key), category_keyboard(key)
     else:
         text, markup = menu_text(), build_menu_keyboard()
     try:
