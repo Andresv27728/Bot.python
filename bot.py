@@ -44,15 +44,20 @@ from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
 import telegram
-from telegram import Bot, BotCommand, Update
+from telegram import Bot, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import InvalidToken, NetworkError, TelegramError
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+)
 
 SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.4"
+VERSION = "3.5"
 START_TIME = time.time()
 
 # --------------------------------------------------------------------------
@@ -108,7 +113,8 @@ USER_AGENT = (
 # (comando, argumentos para la ayuda, descripción para el menú de Telegram)
 COMMANDS: list[tuple[str, str, str]] = [
     ("start", "", "mensaje de bienvenida"),
-    ("help", "", "lista de comandos"),
+    ("menu", " [categoría]", "menú interactivo por categorías"),
+    ("help", " [todo]", "menú por categorías o lista completa"),
     ("ping", "", "comprueba que sigo vivo"),
     ("info", "", "tus datos de Telegram"),
     ("estado", "", "estado y versión del bot"),
@@ -353,20 +359,203 @@ def require_args(context: ContextTypes.DEFAULT_TYPE, usage: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# Menú interactivo por categorías
+# (clave, emoji, nombre corto del botón, título, comandos)
+# --------------------------------------------------------------------------
+CATEGORIES: list[tuple[str, str, str, str, tuple[str, ...]]] = [
+    (
+        "descargas",
+        "🎬",
+        "Descargas y redes",
+        "Descargas y redes sociales",
+        (
+            "mp3", "mp4", "ytmusic", "yt", "spotify", "spotifydl", "pinterest",
+            "instagram", "facebook", "fbstalk", "mediafire", "tourl", "captura",
+        ),
+    ),
+    (
+        "mundo",
+        "🌍",
+        "Mundo y clima",
+        "Mundo, clima y datos",
+        (
+            "clima", "noticias", "wiki", "traducir", "pais", "aire", "sol", "mar",
+            "sismos", "feriados", "covid", "universidad", "deporte", "f1", "iss",
+            "nombre",
+        ),
+    ),
+    ("dinero", "💰", "Dinero", "Dinero y mercados", ("cripto", "divisa", "accion")),
+    (
+        "tech",
+        "🖥",
+        "Tecnología",
+        "Tecnología y web",
+        (
+            "ip", "dns", "whois", "github", "stack", "mc", "http", "app",
+            "producto", "qr", "acortar", "wayback", "color",
+        ),
+    ),
+    ("musica", "🎵", "Música", "Música y audio", ("musica", "letra", "radio", "tts")),
+    (
+        "imagenes",
+        "🎨",
+        "Imágenes",
+        "Imágenes y generadores",
+        (
+            "brat", "bratvid", "banner", "nivel", "cumple", "nasa", "arte", "gif",
+            "perro", "gato", "zorro",
+        ),
+    ),
+    (
+        "ocio",
+        "📚",
+        "Cultura y ocio",
+        "Cultura y ocio",
+        (
+            "receta", "trago", "serie", "anime", "libro", "pelicula", "cerveza",
+            "poema", "chiste", "dato", "consejo", "aburrido",
+        ),
+    ),
+    (
+        "juegos",
+        "🎲",
+        "Juegos y azar",
+        "Juegos y azar",
+        ("dado", "moneda", "carta", "trivia", "pokemon", "tcg"),
+    ),
+    (
+        "ia",
+        "🤖",
+        "IA y herramientas",
+        "IA y herramientas",
+        ("ia", "calc", "claves", "apistatus", "publicar"),
+    ),
+    (
+        "bot",
+        "⚙️",
+        "El bot",
+        "El bot",
+        ("menu", "start", "help", "ping", "info", "estado", "echo"),
+    ),
+]
+
+
+def _command_line(name: str) -> str:
+    """Línea de ayuda de un comando, con sus argumentos."""
+    for command, args, description in COMMANDS:
+        if command == name:
+            return f"/{command}{args} — {description}"
+    return f"/{name}"
+
+
+def build_menu_keyboard() -> InlineKeyboardMarkup:
+    """Botones de categorías, de dos en dos, más el comando al azar."""
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for key, emoji, short, _, commands in CATEGORIES:
+        row.append(
+            InlineKeyboardButton(f"{emoji} {short} ({len(commands)})", callback_data=f"m:c:{key}")
+        )
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("🎲 Comando al azar", callback_data="m:r")])
+    return InlineKeyboardMarkup(rows)
+
+
+def category_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("⬅️ Menú", callback_data="m:h"),
+                InlineKeyboardButton("🎲 Al azar", callback_data="m:r"),
+            ]
+        ]
+    )
+
+
+def menu_text() -> str:
+    total = sum(len(commands) for *_, commands in CATEGORIES)
+    lines = [
+        "🧭 MENÚ DEL BOT",
+        f"v{VERSION} · {total} comandos en {len(CATEGORIES)} categorías",
+        "",
+        "Toca una categoría para ver sus comandos con ejemplos.",
+        "La 🎲 te sugiere uno al azar.",
+        "",
+    ]
+    for _, emoji, _, title, commands in CATEGORIES:
+        lines.append(f"{emoji} {title} · {len(commands)}")
+    lines += ["", "/menu <categoría> abre una directamente.", "/help todo muestra la lista seguida."]
+    return truncate("\n".join(lines))
+
+
+def category_text(key: str) -> str:
+    for cat_key, emoji, _, title, commands in CATEGORIES:
+        if cat_key != key:
+            continue
+        lines = [f"{emoji} {title.upper()} · {len(commands)} comandos", ""]
+        lines.extend(_command_line(name) for name in commands)
+        return truncate("\n".join(lines))
+    return "No encontré esa categoría. Abre /menu para ver las que hay."
+
+
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = " ".join(context.args).strip().lower() if context.args else ""
+    if args:
+        for key, _, _, title, _ in CATEGORIES:
+            if args in (key, title.lower()) or title.lower().startswith(args):
+                await update.effective_message.reply_text(
+                    category_text(key), reply_markup=category_keyboard()
+                )
+                return
+        raise CommandError(f"No conozco la categoría «{args}». Abre /menu para verlas.")
+    await update.effective_message.reply_text(menu_text(), reply_markup=build_menu_keyboard())
+
+
+async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Navegación del menú: categorías, volver y comando al azar."""
+    query = update.callback_query
+    if query is None:
+        return
+    data = query.data or ""
+    if data == "m:r":
+        options = [command for _, _, _, _, commands in CATEGORIES for command in commands]
+        options = [command for command in options if command not in ("start", "help", "menu")]
+        await query.answer(f"🎲 {_command_line(random.choice(options))}", show_alert=True)
+        return
+    await query.answer()
+    if data.startswith("m:c:"):
+        text, markup = category_text(data[4:]), category_keyboard()
+    else:
+        text, markup = menu_text(), build_menu_keyboard()
+    try:
+        await query.edit_message_text(text, reply_markup=markup)
+    except TelegramError:
+        pass
+
+
+# --------------------------------------------------------------------------
 # Comandos básicos
 # --------------------------------------------------------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     name = user.first_name if user and user.first_name else "amigo"
     await update.effective_message.reply_text(
-        f"¡Hola, {name}! 👋\n"
-        f"Soy tu bot de Telegram y tengo {len(COMMANDS)} comandos: clima, noticias, "
-        "Wikipedia, recetas, series, anime, NASA, cripto, divisas, DNS, QR y más.\n"
-        "Escribe /help para verlos todos."
+        f"¡Hola, {name}! 👋\n\n{menu_text()}",
+        reply_markup=build_menu_keyboard(),
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = " ".join(context.args).strip().lower() if context.args else ""
+    if args not in ("todo", "lista", "all"):
+        await update.effective_message.reply_text(
+            menu_text(), reply_markup=build_menu_keyboard()
+        )
+        return
     lines = ["Comandos disponibles:"]
     for command, args, description in COMMANDS:
         lines.append(f"/{command}{args} — {description}")
@@ -3433,6 +3622,7 @@ async def register_commands(application: Application) -> None:
 
 HANDLERS = {
     "start": cmd_start,
+    "menu": cmd_menu,
     "help": cmd_help,
     "ping": cmd_ping,
     "info": cmd_info,
@@ -3527,6 +3717,7 @@ HANDLERS = {
 def register_handlers(application: Application) -> None:
     for command, handler in HANDLERS.items():
         application.add_handler(CommandHandler(command, handler))
+    application.add_handler(CallbackQueryHandler(on_menu_callback, pattern=r"^m:"))
 
 
 # --------------------------------------------------------------------------
