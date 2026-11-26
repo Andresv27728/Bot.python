@@ -61,7 +61,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.12"
+VERSION = "3.13"
 START_TIME = time.time()
 LAST_UPDATE_CHECK = START_TIME
 
@@ -189,7 +189,6 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("app", " <búsqueda>", "busca apps en la App Store"),
     ("mp3", " <enlace|búsqueda>", "descarga el audio de un vídeo de YouTube"),
     ("mp4", " <enlace|búsqueda>", "descarga el vídeo de YouTube"),
-    ("ytlink", " <enlace|id> [mp3|mp4]", "enlace directo de descarga de YouTube"),
     ("spotify", " <búsqueda>", "busca canciones en Spotify"),
     ("spotifydl", " <enlace>", "descarga una canción de Spotify"),
     ("ytmusic", " <búsqueda>", "busca música en YouTube Music"),
@@ -377,7 +376,7 @@ CATEGORIES: list[tuple[str, str, str, str, tuple[str, ...]]] = [
         "🎬",
         "Descargas y redes",
         "Descargas y redes sociales",
-                ("mp3", "mp4", "ytlink", "ytmusic", "yt", "spotify", "spotifydl", "pinterest",
+                ("mp3", "mp4", "ytmusic", "yt", "spotify", "spotifydl", "pinterest",
             "instagram", "facebook", "fbstalk", "mediafire", "tourl", "captura",
         ),
     ),
@@ -3377,43 +3376,6 @@ async def tubeapi_media(video_id: str, fmt: str) -> dict:
     return await asyncio.to_thread(tubeapi_media_blocking, video_id, fmt)
 
 
-async def cmd_ytlink(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    args = " ".join(context.args).strip() if context.args else ""
-    if not args:
-        raise CommandError(
-            "Uso: /ytlink <enlace|id> [mp3|mp4]   "
-            "ej. /ytlink https://youtu.be/PxEBw1GWEY0 mp3"
-        )
-    parts = args.split()
-    fmt = "mp3"
-    if len(parts) > 1 and parts[-1].lower() in ("mp3", "mp4"):
-        fmt = parts[-1].lower()
-        parts = parts[:-1]
-    video_id = youtube_video_id(" ".join(parts))
-    if not video_id:
-        raise CommandError("Necesito un enlace o un ID de YouTube (11 caracteres).")
-    message = update.effective_message
-    status = await message.reply_text("⏳ Preparando el enlace directo…")
-    try:
-        media = await tubeapi_media(video_id, fmt)
-    finally:
-        try:
-            await status.delete()
-        except TelegramError:
-            pass
-    duration = int(media.get("duration") or 0)
-    stamp = f"{duration // 60}:{duration % 60:02d}" if duration else "?"
-    lines = [
-        f"🔗 {media['title']}",
-        f"⏱ {stamp} · {fmt.upper()} · listo en {media.get('seconds', 0)} s",
-        "",
-        media["url"],
-        "",
-        "El enlace caduca en unos minutos: ábrelo o guárdalo pronto.",
-    ]
-    await message.reply_text(truncate("\n".join(lines)))
-
-
 async def cmd_spotify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = require_args(context, "/spotify <búsqueda>   ej. /spotify a thousand years")
     result = await yoyo_json("/api/spotifysearch", {"q": query})
@@ -4296,7 +4258,6 @@ HANDLERS = {
     "app": cmd_app,
     "mp3": cmd_mp3,
     "mp4": cmd_mp4,
-    "ytlink": cmd_ytlink,
     "spotify": cmd_spotify,
     "spotifydl": cmd_spotifydl,
     "ytmusic": cmd_ytmusic,
