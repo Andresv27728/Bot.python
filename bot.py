@@ -59,8 +59,9 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.9"
+VERSION = "3.10"
 START_TIME = time.time()
+LAST_UPDATE_CHECK = START_TIME
 
 # --------------------------------------------------------------------------
 # Claves de APIs. Todas son gratis y opcionales: las que vienen puestas son
@@ -643,6 +644,19 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def next_check_in() -> int:
+    """Segundos que faltan para el próximo chequeo automático de GitHub."""
+    remaining = LAST_UPDATE_CHECK + UPDATE_INTERVAL_SECONDS - time.time()
+    return max(0, int(remaining))
+
+
+def human_seconds(seconds: int) -> str:
+    minutes, secs = divmod(max(0, seconds), 60)
+    if minutes:
+        return f"{minutes} min {secs} s"
+    return f"{secs} s"
+
+
 def _version_tuple(value: str) -> tuple[int, ...]:
     """"3.10" se convierte en (3, 10) para poder comparar versiones."""
     numbers = re.findall(r"\d+", value)
@@ -672,12 +686,10 @@ async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
     local = _version_tuple(VERSION)
     latest = _version_tuple(remote)
-    if latest > local:
+    newer = latest > local
+    if newer:
         headline = f"⬆️ Hay una versión nueva: v{remote}. Tú tienes v{VERSION}."
-        advice = (
-            "El auto-update la instala en el próximo chequeo (cada "
-            f"{UPDATE_INTERVAL_SECONDS // 60} min). Si no llega, reinicia el bot."
-        )
+        advice = "Toca ⬆️ Actualizar ahora para instalarla en este momento."
     elif latest < local:
         headline = f"🧪 Vas por delante: v{VERSION} > v{remote} de GitHub."
         advice = "GitHub todavía no tiene ese cambio subido."
@@ -693,9 +705,15 @@ async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"Comandos: {len(COMMANDS)}",
         "",
         advice,
+        f"⏳ Próximo auto-update en {human_seconds(next_check_in())}",
         f"Origen: {UPDATE_URL}",
     ]
-    await update.effective_message.reply_text("\n".join(lines))
+    markup = None
+    if newer:
+        markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬆️ Actualizar ahora", callback_data="upd:now")]]
+        )
+    await update.effective_message.reply_text("\n".join(lines), reply_markup=markup)
 
 
 async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3773,6 +3791,8 @@ def fetch_latest_source() -> str | None:
 
 def check_and_update(verbose: bool = True) -> bool:
     """Escribe la versión de GitHub si es distinta. True si hay que reiniciar."""
+    global LAST_UPDATE_CHECK
+    LAST_UPDATE_CHECK = time.time()
     source = fetch_latest_source()
     if source is None:
         return False
@@ -3810,9 +3830,33 @@ def restart_with_new_version() -> None:
 async def auto_update_loop() -> None:
     """Comprueba GitHub cada UPDATE_INTERVAL_SECONDS."""
     while True:
-        await asyncio.sleep(UPDATE_INTERVAL_SECONDS)
+        await asyncio.sleep(max(1, next_check_in()))
         if check_and_update(verbose=False):
             restart_with_new_version()
+
+
+async def on_update_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Instala la versión nueva al tocar el botón de /version."""
+    query = update.callback_query
+    if query is None:
+        return
+    message = update.effective_message
+    await query.answer("⬆️ Comprobando GitHub…")
+    try:
+        changed = await asyncio.to_thread(check_and_update, False)
+    except Exception as exc:  # aviso claro si algo revienta
+        await message.reply_text(f"⚠️ No pude actualizar: {exc}")
+        return
+    if not changed:
+        await message.reply_text(
+            "ℹ️ No hay nada que instalar: ya estás en la última versión "
+            f"(v{VERSION}).\n⏳ Próximo auto-update en "
+            f"{human_seconds(next_check_in())}."
+        )
+        return
+    await message.reply_text("✅ Versión nueva descargada. Reiniciando el bot…")
+    await asyncio.sleep(1)
+    restart_with_new_version()
 
 
 async def on_startup(application: Application) -> None:
@@ -3932,6 +3976,7 @@ def register_handlers(application: Application) -> None:
     for command, handler in HANDLERS.items():
         application.add_handler(CommandHandler(command, handler))
     application.add_handler(CallbackQueryHandler(on_menu_callback, pattern=r"^m:"))
+    application.add_handler(CallbackQueryHandler(on_update_callback, pattern=r"^upd:"))
 
 
 # --------------------------------------------------------------------------
