@@ -76,7 +76,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.25"
+VERSION = "3.26"
 START_TIME = time.time()
 LAST_UPDATE_CHECK = START_TIME
 
@@ -5078,15 +5078,98 @@ async def cmd_captura(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.effective_message.reply_photo(photo=blob, caption=f"🖥 {link}"[:1000])
 
 
+# --------------------------------------------------------------------------
+# Respuestas de IA con animación: primero "pensando" y luego se escriben solas
+# --------------------------------------------------------------------------
+AI_THINKING_FRAMES = (
+    "🤔 Pensando",
+    "🤔 Pensando.",
+    "🤔 Pensando..",
+    "🤔 Pensando...",
+)
+AI_THINKING_SECONDS = 1.5  # cada cuánto cambia la animación de pensar
+AI_TYPE_SECONDS = 0.5  # cada cuánto aparece un trozo nuevo de la respuesta
+AI_TYPE_MAX_SECONDS = 25  # tope de la animación de escritura
+AI_TEXT_LIMIT = 4000  # Telegram corta en 4096
+
+
+async def _ai_edit(panel, text: str) -> bool:
+    """Edita el mensaje del panel; si Telegram pide esperar, le hace caso."""
+    try:
+        await panel.edit_text(text)
+        return True
+    except RetryAfter as exc:
+        await asyncio.sleep(float(getattr(exc, "retry_after", 3) or 3))
+        return False
+    except TelegramError:
+        return False
+
+
+async def _ai_thinking(panel) -> None:
+    """Animación de pensando: los puntitos van y vuelven sin parar."""
+    step = 0
+    while True:
+        await _ai_edit(panel, AI_THINKING_FRAMES[step % len(AI_THINKING_FRAMES)])
+        step += 1
+        await asyncio.sleep(AI_THINKING_SECONDS)
+
+
+async def _ai_type(panel, text: str) -> None:
+    """Escribe la respuesta letra a letra, acelerando para no tardar una vida."""
+    started = time.time()
+    shown = 0
+    chunk = 1
+    while shown < len(text):
+        if time.time() - started > AI_TYPE_MAX_SECONDS:
+            # Se acabó el tiempo de la animación: remate de golpe.
+            shown = max(shown, len(text) - 3)
+        shown = min(len(text), shown + chunk)
+        if await _ai_edit(panel, text[:shown]):
+            await asyncio.sleep(AI_TYPE_SECONDS)
+        # Letra a letra al principio y cada vez más rápido en respuestas largas.
+        chunk = min(30, 1 + shown // 10)
+
+
+async def ai_reply(message, fetch, prefix: str = "🤖") -> str:
+    """Pide la respuesta a la IA con “pensando…” y la escribe letra a letra."""
+    panel = await message.reply_text(AI_THINKING_FRAMES[0])
+    thinking = asyncio.create_task(_ai_thinking(panel))
+    try:
+        answer = str(await fetch())
+    except BaseException:
+        thinking.cancel()
+        try:
+            await panel.delete()
+        except TelegramError:
+            pass
+        raise
+    thinking.cancel()
+    text = (f"{prefix} {answer}".strip() if prefix else answer.strip())[:AI_TEXT_LIMIT]
+    if not text:
+        try:
+            await panel.delete()
+        except TelegramError:
+            pass
+        raise CommandError("La IA no devolvió respuesta.")
+    await _ai_type(panel, text)
+    return answer
+
+
 async def cmd_ia(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     prompt = require_args(context, "/ia <pregunta>   ej. /ia explícame la fotosíntesis")
-    result = await yoyo_json("/api/deepseek", {"prompt": prompt}, timeout=180)
-    if not isinstance(result, dict):
-        raise CommandError("La IA no devolvió respuesta.")
-    answer = result.get("answer") or result.get("response")
-    if not answer:
-        raise CommandError(str(result.get("message") or "La IA no devolvió respuesta."))
-    await update.effective_message.reply_text(truncate(f"🤖 {answer}"))
+
+    async def fetch() -> str:
+        result = await yoyo_json("/api/deepseek", {"prompt": prompt}, timeout=180)
+        if not isinstance(result, dict):
+            raise CommandError("La IA no devolvió respuesta.")
+        answer = result.get("answer") or result.get("response")
+        if not answer:
+            raise CommandError(
+                str(result.get("message") or "La IA no devolvió respuesta.")
+            )
+        return str(answer)
+
+    await ai_reply(update.effective_message, fetch, "🤖")
 
 
 async def cmd_tts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5580,8 +5663,9 @@ async def cmd_deepai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     prompt = require_args(
         context, "/deepai <pregunta>   ej. /deepai explícame los agujeros negros"
     )
-    answer = await deepai_chat(prompt)
-    await update.effective_message.reply_text(truncate(f"🌀 {answer}"))
+    await ai_reply(
+        update.effective_message, lambda: deepai_chat(prompt), "🌀"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -5878,15 +5962,7 @@ async def cmd_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
     if not re.match(r"^https?://", url, re.I):
         raise CommandError("Mándame un enlace que empiece por http:// o https://")
-    status = await update.effective_message.reply_text("🧠 Leyendo el enlace…")
-    try:
-        result = await summarize_url(url)
-    finally:
-        try:
-            await status.delete()
-        except TelegramError:
-            pass
-    await update.effective_message.reply_text(result)
+    await ai_reply(update.effective_message, lambda: summarize_url(url), "")
 
 
 # --------------------------------------------------------------------------
