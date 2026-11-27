@@ -76,7 +76,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.24"
+VERSION = "3.25"
 START_TIME = time.time()
 LAST_UPDATE_CHECK = START_TIME
 
@@ -194,7 +194,7 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("cerveza", " <nombre>", "cervecerías de Open Brewery DB"),
     ("producto", " <código de barras>", "info nutricional de un producto"),
     ("musica", " <artista>", "ficha de un artista en MusicBrainz"),
-    ("letra", " <artista> - <canción>", "letra sincronizada (.lrc) de una canción"),
+    ("letra", " <artista> - <canción>", "letra de una canción"),
     ("color", " <hex>", "datos de un color (ej. /color 24b1e0)"),
     ("aburrido", "", "una actividad al azar para no aburrirte"),
     ("zorro", "", "foto de un zorro"),
@@ -207,7 +207,7 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("deporte", " <equipo>", "ficha de un equipo (TheSportsDB)"),
     ("covid", " [país]", "datos de COVID-19 de un país o del mundo"),
     ("app", " <búsqueda>", "busca apps en la App Store"),
-    ("mp3", " <enlace|búsqueda>", "audio con portada, datos y letra sincronizada"),
+    ("mp3", " <enlace|búsqueda>", "audio con portada y todos sus datos"),
     ("mp4", " [calidad] <enlace|búsqueda>", "vídeo con su ficha completa (360p, 720p…)"),
     ("spotify", " <búsqueda>", "busca canciones en Spotify"),
     ("spotifydl", " <enlace>", "descarga una canción de Spotify"),
@@ -2800,7 +2800,7 @@ async def cmd_letra(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not artist or not title:
         raise CommandError("Me faltó el artista o la canción.")
     message = update.effective_message
-    status = await message.reply_text("🎤 Buscando la letra sincronizada…")
+    status = await message.reply_text("🎤 Buscando la letra…")
     try:
         info = await song_metadata(artist, title)
         info.setdefault("artist", artist)
@@ -4350,8 +4350,6 @@ def song_caption(info: dict, extra: str = "") -> str:
         lines.append(extra)
     if info.get("cover"):
         lines.append("🖼 Portada incluida en la carátula y en las etiquetas del MP3")
-    if info.get("providers"):
-        lines.append(f"🔎 Datos: {info['providers']}")
     return "\n".join(lines)
 
 
@@ -4373,8 +4371,6 @@ def video_caption(details: dict, resolution: int = 0) -> str:
         bits.append(str(details["category"]))
     if bits:
         lines.append("📊 " + " · ".join(bits))
-    if details.get("providers"):
-        lines.append(f"🔎 Datos: {details['providers']}")
     return "\n".join(lines)
 
 
@@ -4438,16 +4434,6 @@ def parse_lrc(text: str) -> list[tuple[float, str]]:
     return entries
 
 
-def lrc_preview(lines: list[tuple[float, str]], limit: int = 16) -> str:
-    shown = []
-    for seconds, text in lines[:limit]:
-        stamp = f"{int(seconds) // 60:02d}:{int(seconds) % 60:02d}"
-        shown.append(f"[{stamp}] {text}")
-    if len(lines) > limit:
-        shown.append(f"… y {len(lines) - limit} líneas más en el archivo .lrc")
-    return "\n".join(shown)
-
-
 async def synced_lyrics(artist: str, title: str, album: str = "", duration: int = 0) -> dict:
     """Letra con tiempos (LRCLIB) o, si no hay, letra normal (lyrics.ovh)."""
     result = {"synced": "", "plain": "", "lines": [], "source": ""}
@@ -4479,53 +4465,35 @@ async def synced_lyrics(artist: str, title: str, album: str = "", duration: int 
     return result
 
 
-def lrc_filename(artist: str, title: str) -> str:
-    name = f"{artist or ''} - {title or 'letra'}".strip(" -")
-    name = re.sub(r'[\\/:*?"<>|\n\r\t]', " ", name)
-    return re.sub(r"\s+", " ", name).strip()[:90] + ".lrc"
-
-
-async def send_lyrics(message, info: dict, job=None) -> bool:
-    """Manda la letra sincronizada: archivo .lrc + un adelanto con tiempos."""
+async def send_lyrics(message, info: dict) -> bool:
+    """Manda la letra como texto normal: sin archivos .lrc y sin decir de dónde sale."""
     artist = str(info.get("artist") or "")
     title = str(info.get("title") or "")
     if not title:
         return False
-    if job is not None:
-        job.stage = "Buscando la letra sincronizada"
     try:
-        lyrics = await synced_lyrics(artist, title, str(info.get("album") or ""), _as_int(info.get("duration")))
+        lyrics = await synced_lyrics(
+            artist, title, str(info.get("album") or ""), _as_int(info.get("duration"))
+        )
     except CommandError:
         return False
+    body = str(lyrics.get("plain") or "").strip()
+    if not body and lyrics.get("lines"):
+        body = "\n".join(text for _, text in lyrics["lines"]).strip()
+    if not body and lyrics.get("synced"):
+        body = "\n".join(
+            re.sub(r"\[[^\]]*\]", "", line).strip()
+            for line in str(lyrics["synced"]).splitlines()
+            if line.strip()
+        ).strip()
+    if not body:
+        return False
     header = f"🎤 {title}" + (f" — {artist}" if artist else "")
-    if lyrics.get("synced"):
-        try:
-            await message.reply_document(
-                document=lyrics["synced"].encode("utf-8"),
-                filename=lrc_filename(artist, title),
-                caption=f"{header}\n🎼 Letra sincronizada (.lrc) · {lyrics['source']}",
-            )
-        except TelegramError:
-            pass
-        preview = lrc_preview(lyrics["lines"])
-        try:
-            await message.reply_text(
-                truncate(f"{header}\n🎼 Letra sincronizada\n\n{preview}")
-            )
-        except TelegramError:
-            return False
-        return True
-    if lyrics.get("plain"):
-        try:
-            await message.reply_text(
-                truncate(
-                    f"{header}\n🎼 Letra (sin tiempos) · {lyrics['source']}\n\n{lyrics['plain']}"
-                )
-            )
-        except TelegramError:
-            return False
-        return True
-    return False
+    try:
+        await message.reply_text(truncate(f"{header}\n\n{body}"))
+    except TelegramError:
+        return False
+    return True
 
 
 async def send_song(
@@ -4540,9 +4508,8 @@ async def send_song(
     cancelled=None,
     progress=None,
     extra: str = "",
-    with_lyrics: bool = True,
 ) -> bool:
-    """Baja un audio, le pone portada, etiquetas, datos y su letra sincronizada."""
+    """Baja un audio y le pone portada y todos sus datos en las etiquetas internas."""
     info = await song_metadata(artist, title, album, duration, job=job)
     if job is not None:
         job.stage = "Etiquetando el audio con la portada y los datos"
@@ -4561,8 +4528,6 @@ async def send_song(
         cover,
         _thumbnail(cover),
     )
-    if ok and with_lyrics:
-        await send_lyrics(message, info, job)
     return ok
 
 
