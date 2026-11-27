@@ -36,7 +36,10 @@ import operator
 import os
 import random
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 import uuid
@@ -48,11 +51,21 @@ from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
 import telegram
-from telegram import Bot, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    Bot,
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InlineQueryResultArticle,
+    InlineQueryResultPhoto,
+    InputTextMessageContent,
+    Update,
+)
 from telegram.error import InvalidToken, NetworkError, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    InlineQueryHandler,
     CommandHandler,
     ContextTypes,
 )
@@ -61,7 +74,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.19"
+VERSION = "3.20"
 START_TIME = time.time()
 LAST_UPDATE_CHECK = START_TIME
 
@@ -122,6 +135,11 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("help", " [todo]", "menú por categorías o lista completa"),
     ("ping", "", "comprueba que sigo vivo"),
     ("info", "", "tus datos de Telegram"),
+    ("buscar", " <texto>", "encuentra un comando por nombre o tema"),
+    ("salud", "", "estado de las APIs y de la caché"),
+    ("recordar", " [tiempo] <texto>", "te aviso en X tiempo (10m, 2h, 09:30)"),
+    ("convertir", " <formato>", "convierte el archivo al que respondes"),
+    ("resumen", " <url>", "resume el contenido de un enlace"),
     ("estado", "", "estado y versión del bot"),
     ("version", "", "compara tu versión con la de GitHub"),
     ("calc", " <operación>", "calculadora (ej. 2+2*3)"),
@@ -359,6 +377,179 @@ def money(value: float) -> str:
     return f"{value:,.6f}"
 
 
+# --------------------------------------------------------------------------
+# Estado persistente (recordatorios, preferencias y uso de comandos)
+# --------------------------------------------------------------------------
+DATA_FILE = SELF_PATH.with_name("bot_data.json")
+
+# Tu ID de Telegram para recibir avisos cuando una API falle (míralo en /info).
+OWNER_ID: int | None = None
+
+_DATA: dict = {"reminders": [], "usage": {}, "prefs": {}}
+_DATA_DIRTY = False
+
+
+def load_data() -> None:
+    try:
+        parsed = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        return
+    if not isinstance(parsed, dict):
+        return
+    for key in ("reminders", "usage", "prefs"):
+        if isinstance(parsed.get(key), type(_DATA[key])):
+            _DATA[key] = parsed[key]
+
+
+def save_data(force: bool = False) -> None:
+    global _DATA_DIRTY
+    if not _DATA_DIRTY and not force:
+        return
+    try:
+        DATA_FILE.write_text(
+            json.dumps(_DATA, ensure_ascii=False, indent=1), encoding="utf-8"
+        )
+        _DATA_DIRTY = False
+    except OSError as exc:
+        print(f"No pude guardar {DATA_FILE.name}: {exc}")
+
+
+def bump_usage(command: str) -> None:
+    global _DATA_DIRTY
+    _DATA["usage"][command] = int(_DATA["usage"].get(command, 0)) + 1
+    _DATA_DIRTY = True
+
+
+# --------------------------------------------------------------------------
+# Caché con caducidad (ahorra latencia y cupo de las APIs)
+# --------------------------------------------------------------------------
+_CACHE: dict[str, tuple[float, object]] = {}
+_CACHE_STATS = {"hits": 0, "misses": 0}
+_CACHE_MAX = 400
+
+
+async def cached(key: str, ttl: int, factory) -> object:
+    """Devuelve el valor cacheado o lo calcula con factory() y lo guarda."""
+    entry = _CACHE.get(key)
+    now = time.time()
+    if entry and entry[0] > now:
+        _CACHE_STATS["hits"] += 1
+        return entry[1]
+    _CACHE_STATS["misses"] += 1
+    value = await factory()
+    if value:
+        if len(_CACHE) > _CACHE_MAX:
+            for stale in [k for k, (exp, _) in _CACHE.items() if exp <= now][:100]:
+                _CACHE.pop(stale, None)
+        _CACHE[key] = (now + ttl, value)
+    return value
+
+
+# --------------------------------------------------------------------------
+# Salud de los proveedores (circuit breaker)
+# --------------------------------------------------------------------------
+_PROVIDERS: dict[str, dict] = {}
+_ALERTS: list[str] = []
+PROVIDER_FAILS_TO_OPEN = 3
+PROVIDER_OPEN_SECONDS = 600
+
+
+def _provider(name: str, label: str) -> dict:
+    return _PROVIDERS.setdefault(
+        name,
+        {
+            "label": label,
+            "fails": 0,
+            "open_until": 0.0,
+            "last_ok": 0.0,
+            "last_error": "",
+            "alerted": False,
+        },
+    )
+
+
+def check_provider(name: str) -> None:
+    """Si el proveedor está en cuarentena, no lo intentamos siquiera."""
+    state = _PROVIDERS.get(name)
+    if not state:
+        return
+    wait = state["open_until"] - time.time()
+    if wait > 0:
+        raise CommandError(
+            f"⏳ {state['label']} está fallando ahora mismo. "
+            f"Lo reintento en {int(wait) + 1} s (detalles en /salud)."
+        )
+
+
+def provider_ok(name: str, label: str) -> None:
+    state = _provider(name, label)
+    state["fails"] = 0
+    state["open_until"] = 0.0
+    state["last_ok"] = time.time()
+    state["alerted"] = False
+
+
+def provider_fail(name: str, label: str, error: object) -> None:
+    state = _provider(name, label)
+    state["fails"] += 1
+    state["last_error"] = str(error)[:140]
+    if state["fails"] >= PROVIDER_FAILS_TO_OPEN:
+        state["open_until"] = time.time() + PROVIDER_OPEN_SECONDS
+        if not state["alerted"]:
+            state["alerted"] = True
+            _ALERTS.append(
+                f"⚠️ {label} lleva {state['fails']} fallos seguidos y queda "
+                f"{PROVIDER_OPEN_SECONDS // 60} min en cuarentena.\nÚltimo: {state['last_error']}"
+            )
+
+
+# --------------------------------------------------------------------------
+# Fechas de los recordatorios
+# --------------------------------------------------------------------------
+_DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def pretty_duration(seconds: float) -> str:
+    total = int(max(0, seconds))
+    days, rest = divmod(total, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes, secs = divmod(rest, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if secs and not days:
+        parts.append(f"{secs}s")
+    return " ".join(parts) or "0s"
+
+
+def parse_when(text: str) -> tuple[float | None, str]:
+    """«10m comprar pan» o «09:30 despertar» → (segundos, texto)."""
+    match = re.match(r"^\s*((?:\d+[smhd]\s*)+|\d{1,2}:\d{2})\s+(.+)$", text, re.I)
+    if not match:
+        return None, text.strip()
+    stamp, rest = match.group(1), match.group(2).strip()
+    clock = re.fullmatch(r"(\d{1,2}):(\d{2})", stamp)
+    if clock:
+        hour, minute = int(clock.group(1)), int(clock.group(2))
+        if hour > 23 or minute > 59:
+            return None, text.strip()
+        now = datetime.now()
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        return (target - now).total_seconds(), rest
+    total = 0
+    for amount, unit in re.findall(r"(\d+)([smhd])", stamp.lower()):
+        total += int(amount) * _DURATION_UNITS[unit]
+    if total <= 0:
+        return None, text.strip()
+    return float(total), rest
+
+
 def require_args(context: ContextTypes.DEFAULT_TYPE, usage: str) -> str:
     text = " ".join(context.args).strip() if context.args else ""
     if not text:
@@ -410,7 +601,7 @@ CATEGORIES: list[tuple[str, str, str, str, tuple[str, ...]]] = [
         "Imágenes y generadores",
         (
             "brat", "bratvid", "banner", "qwindows", "nivel", "cumple", "nasa",
-            "arte", "gif", "perro", "gato", "zorro",
+            "arte", "gif", "perro", "gato", "zorro", "convertir",
         ),
     ),
     (
@@ -435,14 +626,15 @@ CATEGORIES: list[tuple[str, str, str, str, tuple[str, ...]]] = [
         "🤖",
         "IA y herramientas",
         "IA y herramientas",
-        ("ia", "deepai", "calc", "claves", "apistatus", "publicar"),
+        ("ia", "deepai", "calc", "claves", "apistatus", "publicar", "resumen"),
     ),
     (
         "bot",
         "⚙️",
         "El bot",
         "El bot",
-        ("menu", "start", "help", "ping", "info", "estado", "version", "echo"),
+        ("menu", "start", "help", "ping", "info", "estado", "version", "echo",
+            "buscar", "salud", "recordar"),
     ),
 ]
 
@@ -458,6 +650,8 @@ RUNNABLE = {
     for command, args, _ in COMMANDS
     if not _needs_arguments(args) and command not in ("start", "help", "menu", "echo")
 }
+# /recordar sin argumentos lista los pendientes, así que también sirve de botón.
+RUNNABLE.add("recordar")
 
 
 def _command_line(name: str) -> str:
@@ -747,7 +941,9 @@ async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"🧩 Comandos: {len(COMMANDS)}\n"
         f"🐍 Python {sys.version.split()[0]}\n"
         f"📦 python-telegram-bot {telegram.__version__}\n"
-        f"🔄 Auto-update cada {UPDATE_INTERVAL_SECONDS // 60} min"
+        f"🔄 Auto-update cada {UPDATE_INTERVAL_SECONDS // 60} min\n"
+        f"🗄 Caché: {len(_CACHE)} entradas\n\n"
+        f"{usage_report()}"
     )
 
 
@@ -899,7 +1095,8 @@ async def weather_report(city: str) -> str:
 
 async def cmd_clima(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     city = require_args(context, "/clima <ciudad>   ej. /clima Bogotá")
-    await update.effective_message.reply_text(truncate(await weather_report(city)))
+    report = await cached(f"clima:{fold(city)}", 600, lambda: weather_report(city))
+    await update.effective_message.reply_text(truncate(str(report)))
 
 
 # --------------------------------------------------------------------------
@@ -990,7 +1187,8 @@ async def wiki_report(query: str) -> str:
 
 async def cmd_wiki(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = require_args(context, "/wiki <tema>   ej. /wiki Python")
-    await update.effective_message.reply_text(truncate(await wiki_report(query)))
+    report = await cached(f"wiki:{fold(query)}", 1800, lambda: wiki_report(query))
+    await update.effective_message.reply_text(truncate(str(report)))
 
 
 # --------------------------------------------------------------------------
@@ -2751,7 +2949,9 @@ async def tcg_report(query: str) -> tuple[str, bytes | None]:
 
 async def cmd_tcg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = require_args(context, "/tcg <carta>   ej. /tcg pikachu")
-    report, image = await tcg_report(query)
+    report, image = await cached(
+        f"tcg:{fold(query)}", 3600, lambda: tcg_report(query)
+    )
     message = update.effective_message
     if image:
         try:
@@ -3090,6 +3290,25 @@ async def yoyo_json(
     method: str = "GET",
     payload: dict | None = None,
     timeout: int = YOYO_TIMEOUT,
+) -> object:
+    check_provider("yosoyyo")
+    try:
+        result = await _yoyo_json_once(path, params, method, payload, timeout)
+    except CommandError:
+        raise
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+        provider_fail("yosoyyo", "YOSOYYO", exc)
+        raise
+    provider_ok("yosoyyo", "YOSOYYO")
+    return result
+
+
+async def _yoyo_json_once(
+    path: str,
+    params: dict | None,
+    method: str,
+    payload: dict | None,
+    timeout: int,
 ) -> object:
     body, _ = await asyncio.to_thread(
         _yoyo_blocking, path, params, "application/json", method, payload, timeout
@@ -3457,7 +3676,14 @@ def tubeapi_media_blocking(
 
 
 async def tubeapi_media(video_id: str, fmt: str) -> dict:
-    return await asyncio.to_thread(tubeapi_media_blocking, video_id, fmt)
+    check_provider("tubeapi")
+    try:
+        media = await asyncio.to_thread(tubeapi_media_blocking, video_id, fmt)
+    except (CommandError, HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+        provider_fail("tubeapi", "TubeAPI", exc)
+        raise
+    provider_ok("tubeapi", "TubeAPI")
+    return media
 
 
 async def cmd_spotify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3795,10 +4021,14 @@ async def cmd_ytmusic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     query = require_args(
         context, "/ytmusic <búsqueda>   ej. /ytmusic alone"
     )
-    data = await omega_json(
-        "/api/download/play",
-        {"action": "search", "query": query, "format": "mp3"},
-        timeout=OMEGA_TIMEOUT,
+    data = await cached(
+        f"ytmusic:{fold(query)}",
+        600,
+        lambda: omega_json(
+            "/api/download/play",
+            {"action": "search", "query": query, "format": "mp3"},
+            timeout=OMEGA_TIMEOUT,
+        ),
     )
     if not isinstance(data, dict):
         raise CommandError("YouTube Music no devolvió resultados.")
@@ -3817,6 +4047,7 @@ async def cmd_ytmusic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             lines.append(f"   {link}")
     songs = data.get("songs") if isinstance(data.get("songs"), list) else []
     shown = 0
+    buttons: list[list[InlineKeyboardButton]] = []
     if songs:
         lines.append("")
     for song in songs:
@@ -3835,6 +4066,15 @@ async def cmd_ytmusic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         link = _omega_link(song)
         if link:
             lines.append(f"   {link}")
+        if video:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"⬇️ {shown}. {str(song.get('title'))[:24]}",
+                        callback_data=f"dl:{video}",
+                    )
+                ]
+            )
     if not shown:
         albums = [a for a in data.get("albums") or [] if isinstance(a, dict) and a.get("title")]
         if not albums:
@@ -3844,8 +4084,11 @@ async def cmd_ytmusic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             artist = str(album.get("artist") or "").strip()
             lines.append(f"💿 {album.get('title')}" + (f" — {artist}" if artist else ""))
     lines.append("")
-    lines.append("Para bajar el audio de una: /mp3 <enlace>")
-    await update.effective_message.reply_text(truncate("\n".join(lines)))
+    lines.append("Toca ⬇️ para bajar el audio, o usa /mp3 <enlace>")
+    await update.effective_message.reply_text(
+        truncate("\n".join(lines)),
+        reply_markup=InlineKeyboardMarkup(buttons[:8]) if buttons else None,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -4107,7 +4350,14 @@ def _deepai_chat_blocking(prompt: str, timeout: int = 90, language: str = "es") 
 
 
 async def deepai_chat(prompt: str) -> str:
-    return await asyncio.to_thread(_deepai_chat_blocking, prompt)
+    check_provider("deepai")
+    try:
+        answer = await asyncio.to_thread(_deepai_chat_blocking, prompt)
+    except (CommandError, HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+        provider_fail("deepai", "DeepAI", exc)
+        raise
+    provider_ok("deepai", "DeepAI")
+    return answer
 
 
 async def cmd_deepai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4116,6 +4366,372 @@ async def cmd_deepai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
     answer = await deepai_chat(prompt)
     await update.effective_message.reply_text(truncate(f"🌀 {answer}"))
+
+
+# --------------------------------------------------------------------------
+# Buscador de comandos
+# --------------------------------------------------------------------------
+def find_commands(query: str, limit: int = 8) -> list[tuple[str, str, str]]:
+    """Busca comandos por nombre y descripción, sin tildes ni mayúsculas."""
+    needle = fold(query)
+    if not needle:
+        return []
+    scored: list[tuple[int, tuple[str, str, str]]] = []
+    for item in COMMANDS:
+        command, _, description = item
+        name = fold(command)
+        haystack = f"{name} {fold(description)}"
+        if needle == name:
+            score = 100
+        elif name.startswith(needle):
+            score = 80
+        elif needle in name:
+            score = 60
+        elif needle in haystack:
+            score = 40
+        elif all(word in haystack for word in needle.split()):
+            score = 20
+        elif any(
+            word.startswith(needle) or (len(word) >= 4 and needle.startswith(word))
+            for word in haystack.split()
+        ):
+            score = 15
+        else:
+            continue
+        scored.append((score, item))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _, item in scored[:limit]]
+
+
+async def cmd_buscar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = " ".join(context.args).strip() if context.args else ""
+    if not query:
+        raise CommandError("Uso: /buscar <texto>   ej. /buscar clima")
+    matches = find_commands(query)
+    if not matches:
+        raise CommandError(f"No encontré comandos que hablen de «{query}». Abre /menu.")
+    lines = [f"🔎 Resultados para «{query}»", ""]
+    lines.extend(_command_line(command) for command, _, _ in matches)
+    lines += ["", "Abre /menu para verlos por categorías."]
+    await update.effective_message.reply_text(truncate("\n".join(lines)))
+
+
+# --------------------------------------------------------------------------
+# Salud de las APIs y métricas
+# --------------------------------------------------------------------------
+def provider_report() -> str:
+    lines = ["🩺 SALUD DE LAS APIS", ""]
+    if not _PROVIDERS:
+        lines.append("Todavía sin datos: usa algún comando con API y vuelve a mirar.")
+    for state in _PROVIDERS.values():
+        wait = state["open_until"] - time.time()
+        if wait > 0:
+            status = f"🔴 en cuarentena ({int(wait) + 1} s)"
+        elif state["fails"]:
+            status = f"🟡 {state['fails']} fallo(s) seguidos"
+        else:
+            status = "🟢 bien"
+        last_ok = (
+            datetime.fromtimestamp(state["last_ok"]).strftime("%H:%M:%S")
+            if state["last_ok"]
+            else "—"
+        )
+        lines.append(f"{status} · {state['label']} · última OK: {last_ok}")
+        if state["fails"] and state["last_error"]:
+            lines.append(f"   ↳ {state['last_error']}")
+    total = _CACHE_STATS["hits"] + _CACHE_STATS["misses"]
+    rate = (100 * _CACHE_STATS["hits"] / total) if total else 0
+    lines += [
+        "",
+        f"🗄 Caché: {len(_CACHE)} entradas · {_CACHE_STATS['hits']}/{total} aciertos ({rate:.0f}%)",
+        f"⏱ Activo desde hace {uptime_text()}",
+        f"🧩 Comandos: {len(COMMANDS)}",
+    ]
+    return "\n".join(lines)
+
+
+async def cmd_salud(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(truncate(provider_report()))
+
+
+def usage_report(limit: int = 5) -> str:
+    usage = _DATA["usage"]
+    if not usage:
+        return "📊 Uso: todavía sin datos"
+    top = sorted(usage.items(), key=lambda pair: int(pair[1]), reverse=True)[:limit]
+    total = sum(int(value) for value in usage.values())
+    lines = [f"📊 Comandos usados: {total}", ""]
+    lines.extend(f"{index}. /{name} — {count}" for index, (name, count) in enumerate(top, 1))
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# Recordatorios
+# --------------------------------------------------------------------------
+REMINDER_MAX_SECONDS = 30 * 86400
+
+
+def reminders_of(chat_id: object) -> list[dict]:
+    return [item for item in _DATA["reminders"] if str(item.get("chat_id")) == str(chat_id)]
+
+
+async def cmd_recordar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    chat_id = getattr(chat, "id", None) or getattr(message, "chat_id", 0)
+    raw = " ".join(context.args).strip() if context.args else ""
+    if not raw:
+        items = sorted(reminders_of(chat_id), key=lambda item: item.get("due", 0))
+        if not items:
+            raise CommandError(
+                "No tienes recordatorios pendientes.\n"
+                "Uso: /recordar 10m llamar a mamá\nTambién: /recordar 09:30 despertar"
+            )
+        rows = [
+            [InlineKeyboardButton(f"❌ {item['text'][:30]}", callback_data=f"rm:{item['id']}")]
+            for item in items[:8]
+        ]
+        lines = ["⏰ TUS RECORDATORIOS", ""]
+        for item in items[:10]:
+            lines.append(
+                f"• {str(item.get('text'))[:60]} — en "
+                f"{pretty_duration(float(item.get('due', 0)) - time.time())}"
+            )
+        lines += ["", "Toca uno para cancelarlo."]
+        await message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
+        return
+    seconds, text = parse_when(raw)
+    if seconds is None:
+        raise CommandError(
+            "No entendí cuándo. Usa 10m, 2h, 1d o una hora como 09:30.\n"
+            "Ejemplo: /recordar 15m sacar la ropa"
+        )
+    if not text:
+        raise CommandError("¿Qué te recuerdo? Ejemplo: /recordar 10m llamar a mamá")
+    if seconds > REMINDER_MAX_SECONDS:
+        raise CommandError("Puedo recordártelo como máximo dentro de 30 días.")
+    if len(text) > 300:
+        raise CommandError("El recordatorio es muy largo (máximo 300 caracteres).")
+    reminder = {
+        "id": uuid.uuid4().hex[:10],
+        "chat_id": chat_id,
+        "text": text,
+        "due": time.time() + seconds,
+        "user": getattr(update.effective_user, "first_name", "") or "",
+    }
+    _DATA["reminders"].append(reminder)
+    save_data(force=True)
+    when = datetime.fromtimestamp(reminder["due"]).strftime("%d/%m %H:%M")
+    await message.reply_text(f"⏰ Listo: te aviso el {when} ({pretty_duration(seconds)}).\n📝 {text}")
+
+
+async def on_reminder_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    reminder_id = (query.data or "")[3:]
+    before = len(_DATA["reminders"])
+    _DATA["reminders"] = [
+        item for item in _DATA["reminders"] if item.get("id") != reminder_id
+    ]
+    removed = before - len(_DATA["reminders"])
+    if removed:
+        save_data(force=True)
+    await query.answer(
+        "Recordatorio cancelado ✅" if removed else "Ese recordatorio ya no existe."
+    )
+
+
+# --------------------------------------------------------------------------
+# Conversión de archivos
+# --------------------------------------------------------------------------
+IMAGE_FORMATS = {"jpg", "jpeg", "png", "webp"}
+MEDIA_FORMATS = {"mp3", "ogg", "m4a", "wav", "mp4", "gif", "webm"}
+
+
+def convert_image(blob: bytes, target: str) -> bytes:
+    from PIL import Image
+
+    image = Image.open(io.BytesIO(blob))
+    if target in ("jpg", "jpeg"):
+        if image.mode in ("RGBA", "LA", "P"):
+            image = image.convert("RGBA")
+            background = Image.new("RGB", image.size, (255, 255, 255))
+            background.paste(image, mask=image.split()[-1])
+            image = background
+        else:
+            image = image.convert("RGB")
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG" if target in ("jpg", "jpeg") else target.upper())
+    return buffer.getvalue()
+
+
+def convert_media(blob: bytes, target: str) -> bytes:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise CommandError(
+            "Este hosting no tiene ffmpeg, así que solo puedo convertir imágenes "
+            "(jpg, png, webp)."
+        )
+    with tempfile.TemporaryDirectory() as folder:
+        source = Path(folder) / "entrada"
+        output = Path(folder) / f"salida.{target}"
+        source.write_bytes(blob)
+        command = [ffmpeg, "-y", "-loglevel", "error", "-i", str(source)]
+        if target in ("mp3", "ogg", "m4a", "wav"):
+            command.append("-vn")
+        command.append(str(output))
+        result = subprocess.run(command, capture_output=True, timeout=300)
+        if result.returncode != 0 or not output.exists():
+            detail = result.stderr.decode("utf-8", "replace")[-200:].strip()
+            raise CommandError(f"ffmpeg no pudo convertir el archivo. {detail}")
+        return output.read_bytes()
+
+
+async def cmd_convertir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    replied = getattr(message, "reply_to_message", None)
+    target = context.args[0].lower().lstrip(".") if context.args else ""
+    if replied is None or not (
+        replied.photo
+        or replied.document
+        or replied.audio
+        or replied.video
+        or replied.voice
+    ):
+        raise CommandError(
+            "Responde a una imagen, audio o vídeo con /convertir <formato>.\n"
+            "Formatos: jpg, png, webp, mp3, ogg, m4a, wav, mp4, gif."
+        )
+    if target not in IMAGE_FORMATS | MEDIA_FORMATS:
+        raise CommandError(
+            "Formato no soportado. Usa jpg, png, webp, mp3, ogg, m4a, wav, mp4 o gif."
+        )
+    if replied.photo:
+        media = replied.photo[-1]
+    else:
+        media = replied.document or replied.audio or replied.video or replied.voice
+    if media is None:
+        raise CommandError("No pude leer el archivo de ese mensaje.")
+    blob = bytes(await (await media.get_file()).download_as_bytearray())
+    if len(blob) > 20 * 1024 * 1024:
+        raise CommandError("El archivo pasa de 20 MB: Telegram no me deja bajarlo así.")
+    status = await message.reply_text("🔄 Convirtiendo…")
+    try:
+        if target in IMAGE_FORMATS:
+            result = await asyncio.to_thread(convert_image, blob, target)
+        else:
+            result = await asyncio.to_thread(convert_media, blob, target)
+    finally:
+        try:
+            await status.delete()
+        except TelegramError:
+            pass
+    filename = f"convertido.{target}"
+    if target in IMAGE_FORMATS:
+        await message.reply_document(document=result, filename=filename)
+    elif target in ("mp3", "ogg", "m4a", "wav"):
+        try:
+            await message.reply_audio(audio=result, filename=filename)
+        except TelegramError:
+            await message.reply_document(document=result, filename=filename)
+    else:
+        try:
+            await message.reply_video(video=result, filename=filename)
+        except TelegramError:
+            await message.reply_document(document=result, filename=filename)
+
+
+# --------------------------------------------------------------------------
+# Resumen de un enlace
+# --------------------------------------------------------------------------
+async def summarize_url(url: str) -> str:
+    page = await http_text(url)
+    text = re.sub(r"\s+", " ", strip_html(page)).strip()
+    if len(text) < 200:
+        raise CommandError("No pude sacar texto de ese enlace (¿necesita iniciar sesión?).")
+    answer = await deepai_chat(
+        "Resume este texto en español en 5 puntos cortos, con viñetas:\n\n" + text[:6000]
+    )
+    return truncate(f"📝 Resumen de {url}\n\n{answer}", 3000)
+
+
+async def cmd_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    url = require_args(
+        context, "/resumen <url>   ej. /resumen https://es.wikipedia.org/wiki/Python"
+    )
+    if not re.match(r"^https?://", url, re.I):
+        raise CommandError("Mándame un enlace que empiece por http:// o https://")
+    status = await update.effective_message.reply_text("🧠 Leyendo el enlace…")
+    try:
+        result = await summarize_url(url)
+    finally:
+        try:
+            await status.delete()
+        except TelegramError:
+            pass
+    await update.effective_message.reply_text(result)
+
+
+# --------------------------------------------------------------------------
+# Botón de descarga de audio en /ytmusic y modo inline
+# --------------------------------------------------------------------------
+async def on_download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    video_id = (query.data or "")[3:]
+    if not youtube_video_id(video_id):
+        await query.answer("Ese enlace no me sirve.", show_alert=True)
+        return
+    await query.answer("⬇️ Bajando el audio…")
+    message = update.effective_message
+    try:
+        media = await tubeapi_media(video_id, "mp3")
+    except CommandError as exc:
+        await message.reply_text(f"⚠️ {exc}")
+        return
+    if not await send_media_safely(
+        message, "audio", media["url"], "youtube.mp3", f"🎵 {media['title']}"
+    ):
+        await message.reply_text(f"No pude subir el audio. Enlace directo:\n{media['url']}")
+
+
+async def on_inline(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Modo inline: @bot gato / @bot perro en cualquier chat."""
+    inline = update.inline_query
+    if inline is None:
+        return
+    lowered = fold(inline.query or "")
+    results: list = []
+    if lowered.startswith(("gato", "cat")):
+        image = f"https://cataas.com/cat?width=800&t={random.randint(1, 10**9)}"
+        results.append(
+            InlineQueryResultPhoto(
+                id="gato", photo_url=image, thumbnail_url=image, caption="🐱"
+            )
+        )
+    if lowered.startswith(("perro", "dog")):
+        data = await http_json("https://dog.ceo/api/breeds/image/random")
+        image = (data or {}).get("message") if isinstance(data, dict) else None
+        if image:
+            results.append(
+                InlineQueryResultPhoto(
+                    id="perro", photo_url=str(image), thumbnail_url=str(image), caption="🐶"
+                )
+            )
+    if not results:
+        results.append(
+            InlineQueryResultArticle(
+                id="ayuda",
+                title="Escribe «gato» o «perro»",
+                description="Mando la foto aquí mismo, sin abrir el chat",
+                input_message_content=InputTextMessageContent(
+                    "🐾 Escribe mi nombre y luego «gato» o «perro»"
+                ),
+            )
+        )
+    await inline.answer(results, cache_time=5)
 
 
 # --------------------------------------------------------------------------
@@ -4138,6 +4754,9 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
             return
         print(f"Error inesperado en un comando: {error!r}")
+        if OWNER_ID:
+            command = getattr(message, "text", "") or ""
+            _ALERTS.append(f"💥 Error en {command[:60] or 'un comando'}: {error!r}"[:400])
         if message is not None:
             await message.reply_text("⚠️ Algo falló con ese comando. Prueba otra vez.")
     except TelegramError as exc:
@@ -4253,9 +4872,11 @@ async def on_update_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def on_startup(application: Application) -> None:
-    """Publica los comandos en Telegram y arranca el auto-update."""
+    """Publica los comandos, carga el estado y arranca las tareas de fondo."""
+    load_data()
     await register_commands(application)
     application.create_task(auto_update_loop())
+    application.create_task(maintenance_loop(application))
 
 
 async def register_commands(application: Application) -> None:
@@ -4275,6 +4896,11 @@ HANDLERS = {
     "help": cmd_help,
     "ping": cmd_ping,
     "info": cmd_info,
+    "buscar": cmd_buscar,
+    "salud": cmd_salud,
+    "recordar": cmd_recordar,
+    "convertir": cmd_convertir,
+    "resumen": cmd_resumen,
     "estado": cmd_estado,
     "version": cmd_version,
     "calc": cmd_calc,
@@ -4366,11 +4992,54 @@ HANDLERS = {
 }
 
 
+async def maintenance_loop(application: Application) -> None:
+    """Entrega recordatorios, avisa al dueño de los fallos y guarda el estado."""
+    while True:
+        now = time.time()
+        pending = [r for r in _DATA["reminders"] if float(r.get("due", 0)) <= now]
+        for reminder in pending:
+            try:
+                await application.bot.send_message(
+                    reminder["chat_id"], f"⏰ Recordatorio: {reminder.get('text', '')}"
+                )
+            except TelegramError as exc:
+                print(f"No pude enviar un recordatorio: {exc}")
+            try:
+                _DATA["reminders"].remove(reminder)
+            except ValueError:
+                pass
+            save_data(force=True)
+        while _ALERTS:
+            alert = _ALERTS[0]
+            print(f"AVISO: {alert}")
+            if OWNER_ID:
+                try:
+                    await application.bot.send_message(OWNER_ID, alert)
+                except TelegramError as exc:
+                    print(f"No pude avisar al dueño: {exc}")
+            _ALERTS.pop(0)
+        save_data()
+        await asyncio.sleep(15)
+
+
+def _counted(command: str, handler):
+    """Envuelve un comando para llevar la cuenta de cuántas veces se usa."""
+
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        bump_usage(command)
+        await handler(update, context)
+
+    return wrapper
+
+
 def register_handlers(application: Application) -> None:
     for command, handler in HANDLERS.items():
-        application.add_handler(CommandHandler(command, handler))
+        application.add_handler(CommandHandler(command, _counted(command, handler)))
     application.add_handler(CallbackQueryHandler(on_menu_callback, pattern=r"^m:"))
     application.add_handler(CallbackQueryHandler(on_update_callback, pattern=r"^upd:"))
+    application.add_handler(CallbackQueryHandler(on_reminder_callback, pattern=r"^rm:"))
+    application.add_handler(CallbackQueryHandler(on_download_callback, pattern=r"^dl:"))
+    application.add_handler(InlineQueryHandler(on_inline))
 
 
 # --------------------------------------------------------------------------
