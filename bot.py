@@ -43,6 +43,7 @@ import tempfile
 import time
 import unicodedata
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -74,7 +75,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.20"
+VERSION = "3.21"
 START_TIME = time.time()
 LAST_UPDATE_CHECK = START_TIME
 
@@ -3342,8 +3343,8 @@ async def yoyo_bytes(
     raise CommandError(str(message or "La API no devolvió ningún archivo."))
 
 
-def _download_media(url: str) -> bytes | None:
-    """Baja un archivo para subirlo al chat (None si falla o pesa demasiado)."""
+def _download_media(url: str, cancelled=None) -> bytes | None:
+    """Baja un archivo para subirlo al chat (None si falla, pesa demasiado o lo cancelan)."""
     request = Request(
         url,
         headers={
@@ -3353,19 +3354,34 @@ def _download_media(url: str) -> bytes | None:
             "Accept": "*/*",
         },
     )
+    chunks: list[bytes] = []
+    size = 0
     try:
         with urlopen(request, timeout=120) as response:
-            data = response.read(YOYO_MAX_UPLOAD + 1)
+            # Por trozos para poder cortar si el usuario cancela y para no
+            # reservar memoria de más en un archivo enorme.
+            while True:
+                if cancelled is not None and cancelled():
+                    return None
+                chunk = response.read(256 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > YOYO_MAX_UPLOAD:
+                    return None
+                chunks.append(chunk)
     except (HTTPError, URLError, TimeoutError, OSError):
         return None
-    return data if len(data) <= YOYO_MAX_UPLOAD else None
+    return b"".join(chunks)
 
 
 async def send_media_safely(
-    message, kind: str, url: str, filename: str, caption: str = ""
+    message, kind: str, url: str, filename: str, caption: str = "", cancelled=None
 ) -> bool:
     """Manda audio, vídeo o documento; si no puede, deja que Telegram lo baje."""
-    blob = await asyncio.to_thread(_download_media, url)
+    blob = await asyncio.to_thread(_download_media, url, cancelled)
+    if cancelled is not None and cancelled():
+        raise DownloadCancelled("Descarga cancelada ⛔️")
     if blob:
         try:
             if kind == "audio":
@@ -3393,6 +3409,169 @@ async def send_media_safely(
         return True
     except TelegramError:
         return False
+
+
+# --------------------------------------------------------------------------
+# Cola de descargas: varias a la vez tumbaban el hosting por memoria
+# --------------------------------------------------------------------------
+DOWNLOAD_LIMIT = 2  # descargas en marcha a la vez en todo el bot
+DOWNLOAD_USER_PENDING = 2  # descargas pendientes por usuario (1 activa + 1 en cola)
+DOWNLOAD_PANEL_SECONDS = 4  # cada cuánto refresco el mensaje de progreso
+
+_DL_ACTIVE = 0
+_DL_QUEUE: list["DownloadJob"] = []
+_DL_JOBS: dict[str, "DownloadJob"] = {}
+
+
+class DownloadCancelled(CommandError):
+    """El usuario pulsó el botón de cancelar."""
+
+
+class DownloadJob:
+    """Una descarga con su hueco en la cola y su mensaje de progreso."""
+
+    def __init__(self, chat_id: int, user_id: int, user_name: str, label: str) -> None:
+        self.id = uuid.uuid4().hex[:8]
+        self.chat_id = chat_id
+        self.user_id = user_id
+        self.user_name = user_name
+        self.label = label
+        self.state = "queued"
+        self.cancelled = False
+        self.stage = "Preparando la descarga"
+        self.created = time.time()
+        self.started = 0.0
+
+
+async def _dl_acquire(job: DownloadJob) -> bool:
+    """Espera un hueco: máximo global y una descarga activa por usuario."""
+    global _DL_ACTIVE
+    while True:
+        if job.cancelled:
+            return False
+        free = _DL_ACTIVE < DOWNLOAD_LIMIT and not any(
+            other.state == "running" and other.user_id == job.user_id
+            for other in _DL_JOBS.values()
+        )
+        if job in _DL_QUEUE:
+            if free and _DL_QUEUE[0] is job:
+                _DL_QUEUE.remove(job)
+                break
+        elif free:
+            break
+        else:
+            _DL_QUEUE.append(job)
+        await asyncio.sleep(0.7)
+    _DL_ACTIVE += 1
+    job.state = "running"
+    job.started = time.time()
+    return True
+
+
+def _dl_release(job: DownloadJob) -> None:
+    global _DL_ACTIVE
+    if job.state == "running":
+        _DL_ACTIVE = max(0, _DL_ACTIVE - 1)
+    if job in _DL_QUEUE:
+        _DL_QUEUE.remove(job)
+    if job.state in ("queued", "running"):
+        job.state = "cancelled" if job.cancelled else "done"
+
+
+def _dl_check(job: DownloadJob) -> None:
+    if job.cancelled:
+        raise DownloadCancelled("Descarga cancelada ⛔️")
+
+
+def _dl_stopped(job: DownloadJob):
+    """Callable para que la descarga por trozos se corte al cancelar."""
+    return lambda: job.cancelled
+
+
+def _dl_user_pending(user_id: int) -> list[DownloadJob]:
+    return [
+        job
+        for job in _DL_JOBS.values()
+        if job.user_id == user_id and job.state in ("queued", "running")
+    ]
+
+
+def _dl_position(job: DownloadJob) -> int:
+    try:
+        return _DL_QUEUE.index(job) + 1
+    except ValueError:
+        return 0
+
+
+def _dl_panel_text(job: DownloadJob) -> str:
+    if job.state == "running":
+        return (
+            "⬇️ Descargando…\n"
+            f"📥 {job.label}\n"
+            f"⚙️ {job.stage} · ⏱ {pretty_duration(time.time() - job.started)}"
+        )
+    position = _dl_position(job)
+    where = f"puesto {position} de {len(_DL_QUEUE)}" if position else "esperando hueco"
+    return (
+        "🕒 Tu descarga está en cola\n"
+        f"📥 {job.label}\n"
+        f"👥 {where} · {_DL_ACTIVE}/{DOWNLOAD_LIMIT} descargas activas\n"
+        f"⏳ Llevas {pretty_duration(time.time() - job.created)} esperando\n"
+        "💡 Puedes cancelarla cuando quieras con el botón de abajo."
+    )
+
+
+def _dl_markup(job: DownloadJob) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("❌ Cancelar descarga", callback_data=f"dls:{job.id}")]]
+    )
+
+
+async def _dl_refresh(job: DownloadJob, panel) -> None:
+    while job.state in ("queued", "running"):
+        try:
+            await panel.edit_text(_dl_panel_text(job), reply_markup=_dl_markup(job))
+        except TelegramError:
+            pass
+        await asyncio.sleep(DOWNLOAD_PANEL_SECONDS)
+
+
+@asynccontextmanager
+async def download_task(update: Update, label: str):
+    """Espera turno para descargar mostrando el progreso y un botón de cancelar."""
+    message = update.effective_message
+    user = getattr(update, "effective_user", None)
+    user_id = int(getattr(user, "id", 0) or 0)
+    pending = _dl_user_pending(user_id)
+    if len(pending) >= DOWNLOAD_USER_PENDING:
+        raise CommandError(
+            f"Ya tienes {len(pending)} descargas pendientes. Espera a que terminen "
+            "o cancélalas con el botón ❌ antes de pedir otra."
+        )
+    job = DownloadJob(
+        int(getattr(message, "chat_id", 0) or 0),
+        user_id,
+        getattr(user, "first_name", "") or "",
+        label,
+    )
+    _DL_JOBS[job.id] = job
+    panel = await message.reply_text(_dl_panel_text(job), reply_markup=_dl_markup(job))
+    refresh = asyncio.create_task(_dl_refresh(job, panel))
+    try:
+        if not await _dl_acquire(job):
+            raise DownloadCancelled("Descarga cancelada ⛔️")
+        yield job
+    finally:
+        _dl_release(job)
+        refresh.cancel()
+        _DL_JOBS.pop(job.id, None)
+        try:
+            if job.cancelled:
+                await panel.edit_text("⛔️ Descarga cancelada. No se envió ningún archivo.")
+            else:
+                await panel.delete()
+        except TelegramError:
+            pass
 
 
 def find_youtube_url(text: str) -> str | None:
@@ -3523,10 +3702,11 @@ async def youtube_download(update: Update, context: ContextTypes.DEFAULT_TYPE, w
     message = update.effective_message
     fmt = "mp3" if want == "audio" else "mp4"
     icon = "🎵" if want == "audio" else "🎬"
-    status = await message.reply_text("⏳ Preparando la descarga, dame un momento…")
+    label = f"{fmt.upper()} · {target[:70]}"
     problems: list[str] = []
-    try:
+    async with download_task(update, label) as job:
         link = await youtube_link(target)
+        job.stage = "Pidiendo los enlaces a YOSOYYO"
         try:
             info = await yoyo_json("/api/youtube/v2", {"url": link, "format": fmt})
             if not isinstance(info, dict):
@@ -3535,48 +3715,57 @@ async def youtube_download(update: Update, context: ContextTypes.DEFAULT_TYPE, w
             if not candidates:
                 raise CommandError("No hay enlaces de descarga para ese vídeo. Prueba con otro.")
             title = f"{icon} {info.get('title') or 'YouTube'}"
+            job.stage = "Descargando el archivo"
             for chosen in candidates[:5]:
+                _dl_check(job)
                 extension = str(
                     chosen.get("extension") or ("m4a" if want == "audio" else "mp4")
                 )
                 resolution = _resolution(chosen.get("quality")) if want == "video" else 0
                 caption = f"{title} · {resolution}p" if resolution else title
                 if await send_media_safely(
-                    message, want, str(chosen["download"]), f"youtube.{extension}", caption
+                    message,
+                    want,
+                    str(chosen["download"]),
+                    f"youtube.{extension}",
+                    caption,
+                    cancelled=_dl_stopped(job),
                 ):
                     return
             problems.append("los enlaces de YOSOYYO no descargaron")
+        except DownloadCancelled:
+            raise
         except CommandError as exc:
             problems.append(str(exc))
+        _dl_check(job)
         video_id = youtube_video_id(link) or youtube_video_id(target)
         if not video_id:
             raise CommandError(problems[-1] if problems else "No pude leer ese enlace.")
+        job.stage = "Probando otro proveedor de descarga" + (
+            " (este no deja elegir calidad)" if height else ""
+        )
         try:
-            await status.edit_text(
-                "⏳ Probando otro proveedor de descarga…"
-                + (" (este no deja elegir calidad)" if height else "")
-            )
-        except TelegramError:
-            pass
-        try:
-            media = await tubeapi_media(video_id, fmt)
+            media = await tubeapi_media(video_id, fmt, cancelled=_dl_stopped(job))
+        except DownloadCancelled:
+            raise
         except CommandError as exc:
             raise CommandError(
                 f"{problems[-1]}\n{exc}" if problems else str(exc)
             )
+        job.stage = "Subiendo el archivo a Telegram"
         if await send_media_safely(
-            message, want, media["url"], f"youtube.{fmt}", f"{icon} {media['title']}"
+            message,
+            want,
+            media["url"],
+            f"youtube.{fmt}",
+            f"{icon} {media['title']}",
+            cancelled=_dl_stopped(job),
         ):
             return
         raise CommandError(
             "No pude subir el archivo, pero este enlace directo sí funciona "
             f"(caduca en unos minutos):\n{media['url']}"
         )
-    finally:
-        try:
-            await status.delete()
-        except TelegramError:
-            pass
 
 
 async def cmd_mp3(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3636,7 +3825,7 @@ def _tubeapi_json(params: dict, timeout: int = 45, attempts: int = 3) -> dict:
 
 
 def tubeapi_media_blocking(
-    video_id: str, fmt: str, poll_seconds: int = 4, max_polls: int = 30
+    video_id: str, fmt: str, poll_seconds: int = 4, max_polls: int = 30, cancelled=None
 ) -> dict:
     """Pide la conversión y espera hasta que TubeAPI devuelva el archivo final."""
     started = time.time()
@@ -3656,6 +3845,8 @@ def tubeapi_media_blocking(
     title = str(init.get("title") or "YouTube")
     duration = int(init.get("duration") or 0)
     for _ in range(max_polls):
+        if cancelled is not None and cancelled():
+            raise DownloadCancelled("Descarga cancelada ⛔️")
         data = _tubeapi_json(
             {
                 "u": encoded,
@@ -3675,10 +3866,14 @@ def tubeapi_media_blocking(
     raise CommandError("TubeAPI tardó demasiado en convertir ese vídeo.")
 
 
-async def tubeapi_media(video_id: str, fmt: str) -> dict:
+async def tubeapi_media(video_id: str, fmt: str, cancelled=None) -> dict:
     check_provider("tubeapi")
     try:
-        media = await asyncio.to_thread(tubeapi_media_blocking, video_id, fmt)
+        media = await asyncio.to_thread(
+            tubeapi_media_blocking, video_id, fmt, 4, 30, cancelled
+        )
+    except DownloadCancelled:
+        raise
     except (CommandError, HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
         provider_fail("tubeapi", "TubeAPI", exc)
         raise
@@ -4687,14 +4882,46 @@ async def on_download_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer("⬇️ Bajando el audio…")
     message = update.effective_message
     try:
-        media = await tubeapi_media(video_id, "mp3")
+        async with download_task(update, "MP3 · audio de /ytmusic") as job:
+            job.stage = "Pidiendo el audio a TubeAPI"
+            media = await tubeapi_media(video_id, "mp3", cancelled=_dl_stopped(job))
+            job.stage = "Subiendo el audio a Telegram"
+            if not await send_media_safely(
+                message,
+                "audio",
+                media["url"],
+                "youtube.mp3",
+                f"🎵 {media['title']}",
+                cancelled=_dl_stopped(job),
+            ):
+                raise CommandError(
+                    f"No pude subir el audio. Enlace directo:\n{media['url']}"
+                )
+    except DownloadCancelled:
+        return
     except CommandError as exc:
         await message.reply_text(f"⚠️ {exc}")
+
+
+async def on_download_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Botón ❌ del mensaje de progreso de una descarga."""
+    query = update.callback_query
+    if query is None:
         return
-    if not await send_media_safely(
-        message, "audio", media["url"], "youtube.mp3", f"🎵 {media['title']}"
-    ):
-        await message.reply_text(f"No pude subir el audio. Enlace directo:\n{media['url']}")
+    job = _DL_JOBS.get((query.data or "")[4:])
+    if job is None:
+        await query.answer("Esa descarga ya terminó.", show_alert=True)
+        return
+    job.cancelled = True
+    if job.state == "queued":
+        if job in _DL_QUEUE:
+            _DL_QUEUE.remove(job)
+        job.state = "cancelled"
+    await query.answer("⛔️ Descarga cancelada")
+    try:
+        await query.edit_message_text("⛔️ Descarga cancelada. No se envió ningún archivo.")
+    except TelegramError:
+        pass
 
 
 async def on_inline(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4742,6 +4969,9 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     error = context.error
     message = getattr(update, "effective_message", None)
     try:
+        if isinstance(error, DownloadCancelled):
+            # El mensaje de progreso ya avisa de la cancelación.
+            return
         if isinstance(error, CommandError):
             if message is not None:
                 await message.reply_text(f"⚠️ {error}")
@@ -5039,6 +5269,7 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CallbackQueryHandler(on_update_callback, pattern=r"^upd:"))
     application.add_handler(CallbackQueryHandler(on_reminder_callback, pattern=r"^rm:"))
     application.add_handler(CallbackQueryHandler(on_download_callback, pattern=r"^dl:"))
+    application.add_handler(CallbackQueryHandler(on_download_cancel, pattern=r"^dls:"))
     application.add_handler(InlineQueryHandler(on_inline))
 
 
