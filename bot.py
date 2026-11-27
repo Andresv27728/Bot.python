@@ -76,7 +76,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.23"
+VERSION = "3.24"
 START_TIME = time.time()
 LAST_UPDATE_CHECK = START_TIME
 
@@ -3475,9 +3475,8 @@ async def send_media_safely(
 # --------------------------------------------------------------------------
 DOWNLOAD_LIMIT = 2  # descargas en marcha a la vez en todo el bot
 DOWNLOAD_USER_PENDING = 2  # descargas pendientes por usuario (1 activa + 1 en cola)
-DOWNLOAD_PANEL_SECONDS = 2  # cada cuánto refresco el panel (animación y barra)
+DOWNLOAD_PANEL_SECONDS = 2  # cada cuánto refresco la animación de carga
 DOWNLOAD_SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-DOWNLOAD_BAR_WIDTH = 14
 
 _DL_ACTIVE = 0
 _DL_TICK = 0  # contador para mover la animación en cada refresco
@@ -3575,13 +3574,6 @@ def _dl_user_pending(user_id: int) -> list[DownloadJob]:
     ]
 
 
-def _dl_position(job: DownloadJob) -> int:
-    try:
-        return _DL_QUEUE.index(job) + 1
-    except ValueError:
-        return 0
-
-
 def _dl_spinner() -> str:
     """Un fotograma de la animación de carga, distinto en cada refresco."""
     global _DL_TICK
@@ -3589,65 +3581,15 @@ def _dl_spinner() -> str:
     return DOWNLOAD_SPINNER[_DL_TICK % len(DOWNLOAD_SPINNER)]
 
 
-def _dl_human(num: int) -> str:
-    for unit, size in (("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024)):
-        if num >= size:
-            return f"{num / size:.1f} {unit}"
-    return f"{max(0, int(num))} B"
-
-
-def _dl_bar(job: DownloadJob) -> str:
-    """Barra de progreso real; si no hay tamaño, una franja que se desliza."""
-    width = DOWNLOAD_BAR_WIDTH
-    if job.total <= 0:
-        span = 4
-        pos = _DL_TICK % (width * 2)
-        if pos >= width:
-            pos = width * 2 - pos
-        return "▱" * pos + "▰" * span + "▱" * max(0, width - pos - span)
-    ratio = min(1.0, max(0.0, job.downloaded / job.total))
-    filled = int(ratio * width)
-    return "▰" * filled + "▱" * (width - filled)
-
-
 def _dl_panel_text(job: DownloadJob) -> str:
-    spin = _dl_spinner()
-    if job.state == "running":
-        elapsed = pretty_duration(time.time() - job.started)
-        if job.total > 0 and job.downloaded > 0:
-            percent = min(100, int(job.downloaded * 100 / job.total))
-            elapsed_dl = max(0.5, time.time() - (job.download_started or job.started))
-            speed = _dl_human(int(job.downloaded / elapsed_dl))
-            return (
-                f"{spin} Descargando… {percent}%\n"
-                f"{_dl_bar(job)}\n"
-                f"💾 {_dl_human(job.downloaded)} de {_dl_human(job.total)}"
-                f" · {speed}/s · ⏱ {elapsed}"
-            )
-        return (
-            f"{spin} {job.stage.rstrip('… .')}…\n"
-            f"{_dl_bar(job)}\n"
-            f"⏱ {elapsed}"
-        )
-    position = _dl_position(job)
-    where = f"puesto {position} de {len(_DL_QUEUE)}" if position else "esperando hueco"
-    return (
-        f"{spin} Preparando tu descarga…\n"
-        f"{_dl_bar(job)}\n"
-        f"👥 {where} · ⏳ {pretty_duration(time.time() - job.created)}"
-    )
-
-
-def _dl_markup(job: DownloadJob) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("❌ Cancelar descarga", callback_data=f"dls:{job.id}")]]
-    )
+    """Solo la animación de carga: sin datos, sin barra y sin botones."""
+    return _dl_spinner()
 
 
 async def _dl_refresh(job: DownloadJob, panel) -> None:
     while job.state in ("queued", "running"):
         try:
-            await panel.edit_text(_dl_panel_text(job), reply_markup=_dl_markup(job))
+            await panel.edit_text(_dl_panel_text(job))
         except RetryAfter as exc:
             # Telegram pide esperar: respeto su tiempo para no inundar el chat.
             await asyncio.sleep(float(getattr(exc, "retry_after", 5) or 5))
@@ -3659,7 +3601,7 @@ async def _dl_refresh(job: DownloadJob, panel) -> None:
 
 @asynccontextmanager
 async def download_task(update: Update, label: str):
-    """Espera turno para descargar mostrando el progreso y un botón de cancelar."""
+    """Espera turno para descargar mostrando solo la animación de carga."""
     message = update.effective_message
     user = getattr(update, "effective_user", None)
     user_id = int(getattr(user, "id", 0) or 0)
@@ -3667,7 +3609,7 @@ async def download_task(update: Update, label: str):
     if len(pending) >= DOWNLOAD_USER_PENDING:
         raise CommandError(
             f"Ya tienes {len(pending)} descargas pendientes. Espera a que terminen "
-            "o cancélalas con el botón ❌ antes de pedir otra."
+            "antes de pedir otra."
         )
     job = DownloadJob(
         int(getattr(message, "chat_id", 0) or 0),
@@ -3676,7 +3618,7 @@ async def download_task(update: Update, label: str):
         label,
     )
     _DL_JOBS[job.id] = job
-    panel = await message.reply_text(_dl_panel_text(job), reply_markup=_dl_markup(job))
+    panel = await message.reply_text(_dl_panel_text(job))
     refresh = asyncio.create_task(_dl_refresh(job, panel))
     try:
         if not await _dl_acquire(job):
@@ -6030,27 +5972,6 @@ async def on_download_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await message.reply_text(f"⚠️ {exc}")
 
 
-async def on_download_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Botón ❌ del mensaje de progreso de una descarga."""
-    query = update.callback_query
-    if query is None:
-        return
-    job = _DL_JOBS.get((query.data or "")[4:])
-    if job is None:
-        await query.answer("Esa descarga ya terminó.", show_alert=True)
-        return
-    job.cancelled = True
-    if job.state == "queued":
-        if job in _DL_QUEUE:
-            _DL_QUEUE.remove(job)
-        job.state = "cancelled"
-    await query.answer("⛔️ Descarga cancelada")
-    try:
-        await query.edit_message_text("⛔️ Descarga cancelada. No se envió ningún archivo.")
-    except TelegramError:
-        pass
-
-
 async def on_inline(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Modo inline: @bot gato / @bot perro en cualquier chat."""
     inline = update.inline_query
@@ -6396,7 +6317,6 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CallbackQueryHandler(on_update_callback, pattern=r"^upd:"))
     application.add_handler(CallbackQueryHandler(on_reminder_callback, pattern=r"^rm:"))
     application.add_handler(CallbackQueryHandler(on_download_callback, pattern=r"^dl:"))
-    application.add_handler(CallbackQueryHandler(on_download_cancel, pattern=r"^dls:"))
     application.add_handler(InlineQueryHandler(on_inline))
 
 
