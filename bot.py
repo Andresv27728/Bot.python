@@ -60,6 +60,8 @@ from telegram import (
     InlineQueryResultArticle,
     InlineQueryResultPhoto,
     InputFile,
+    InputMediaPhoto,
+    InputMediaVideo,
     InputTextMessageContent,
     Update,
 )
@@ -76,7 +78,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.29"
+VERSION = "3.30"
 START_TIME = time.time()
 LAST_UPDATE_CHECK = START_TIME
 
@@ -5021,6 +5023,7 @@ TIKTOK_GAP = 1.25  # su API aguanta más o menos una petición cada 1,25 s
 TIKTOK_CACHE_SECONDS = 180
 TIKTOK_SEARCH_COUNT = 20
 TIKTOK_SEND_RESULTS = 3  # cuántos vídeos de la búsqueda mando
+TIKTOK_ALBUM_BYTES = 60 * 1024 * 1024  # tope de todo el álbum en memoria
 TIKTOK_URL = re.compile(
     r"^(?:https?://)?(?:www\.|vm\.|vt\.|m\.)?(?:tiktok\.com|douyin\.com)/", re.I
 )
@@ -5207,16 +5210,20 @@ async def tiktok_send(message, item: dict, job: "DownloadJob") -> bool:
     """Manda el vídeo o el carrusel de fotos de un resultado de TikTok."""
     caption = tiktok_caption(item)
     if item["images"]:
-        sent = 0
-        for photo in item["images"][:10]:
-            try:
-                await message.reply_photo(
-                    photo=photo, caption=caption if not sent else None
+        fotos = item["images"][:10]
+        try:
+            if len(fotos) == 1:
+                await message.reply_photo(photo=fotos[0], caption=caption)
+            else:
+                await message.reply_media_group(
+                    media=[
+                        InputMediaPhoto(media=foto, caption=caption if index == 0 else None)
+                        for index, foto in enumerate(fotos)
+                    ]
                 )
-                sent += 1
-            except TelegramError:
-                continue
-        return sent > 0
+            return True
+        except TelegramError:
+            return False
     if not re.match(r"^https?://", item["video"] or "", re.I):
         return False
     filename = f"tiktok_{item['id'] or uuid.uuid4().hex[:8]}.mp4"
@@ -5229,6 +5236,64 @@ async def tiktok_send(message, item: dict, job: "DownloadJob") -> bool:
         _dl_stopped(job),
         job.track,
     )
+
+
+def _tiktok_filename(item: dict) -> str:
+    return f"tiktok_{item['id'] or uuid.uuid4().hex[:8]}.mp4"
+
+
+async def tiktok_send_album(message, items: list[dict], job: "DownloadJob") -> int:
+    """Manda los resultados de la búsqueda como un solo álbum de golpe.
+
+    Si al final solo queda un vídeo se manda suelto (un álbum necesita 2).
+    """
+    videos: list[tuple[dict, bytes]] = []
+    total = 0
+    for item in items:
+        _dl_check(job)
+        if item["images"] or not re.match(r"^https?://", item["video"] or "", re.I):
+            continue
+        job.begin()
+        blob = await asyncio.to_thread(
+            _download_media, item["video"], _dl_stopped(job), job.track
+        )
+        _dl_check(job)
+        if not blob:
+            continue
+        if videos and total + len(blob) > TIKTOK_ALBUM_BYTES:
+            break
+        videos.append((item, blob))
+        total += len(blob)
+    if not videos:
+        return 0
+    if len(videos) == 1:
+        item, blob = videos[0]
+        try:
+            await message.reply_video(
+                video=blob,
+                filename=_tiktok_filename(item),
+                caption=tiktok_caption(item)[:1000],
+                supports_streaming=True,
+            )
+            return 1
+        except TelegramError:
+            return 0
+
+    try:
+        await message.reply_media_group(
+            media=[
+                InputMediaVideo(
+                    media=blob,
+                    filename=_tiktok_filename(item),
+                    caption=tiktok_caption(item)[:1000],
+                    supports_streaming=True,
+                )
+                for item, blob in videos
+            ]
+        )
+        return len(videos)
+    except TelegramError:
+        return 0
 
 
 async def cmd_tiktok(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5255,6 +5320,8 @@ async def cmd_tiktok(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         videos = await tiktok_search(raw)
         if not videos:
             raise CommandError(f"No encontré vídeos de «{raw}» en TikTok.")
+        job.stage = "Descargando los vídeos"
+        resultados: list[dict] = []
         sent = 0
         for item in videos[:TIKTOK_SEND_RESULTS]:
             _dl_check(job)
@@ -5263,10 +5330,13 @@ async def cmd_tiktok(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     item = await tiktok_video(item["url"])
                 except CommandError:
                     continue
-            job.begin()
-            job.stage = "Descargando y subiendo el vídeo"
-            if await tiktok_send(message, item, job):
-                sent += 1
+            if item["images"]:
+                # Los carruseles de fotos van en su propio álbum.
+                if await tiktok_send(message, item, job):
+                    sent += 1
+                continue
+            resultados.append(item)
+        sent += await tiktok_send_album(message, resultados, job)
         if not sent:
             raise CommandError(
                 f"Encontré {len(videos)} vídeos de «{raw}», pero no pude bajar ninguno."
