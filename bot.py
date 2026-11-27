@@ -62,7 +62,7 @@ from telegram import (
     InputTextMessageContent,
     Update,
 )
-from telegram.error import InvalidToken, NetworkError, TelegramError
+from telegram.error import InvalidToken, NetworkError, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -75,7 +75,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.21"
+VERSION = "3.22"
 START_TIME = time.time()
 LAST_UPDATE_CHECK = START_TIME
 
@@ -3343,8 +3343,11 @@ async def yoyo_bytes(
     raise CommandError(str(message or "La API no devolvió ningún archivo."))
 
 
-def _download_media(url: str, cancelled=None) -> bytes | None:
-    """Baja un archivo para subirlo al chat (None si falla, pesa demasiado o lo cancelan)."""
+def _download_media(url: str, cancelled=None, progress=None) -> bytes | None:
+    """Baja un archivo para subirlo al chat (None si falla, pesa demasiado o lo cancelan).
+
+    Si se pasa `progress`, se llama con (bajado, total) para pintar la barra.
+    """
     request = Request(
         url,
         headers={
@@ -3360,6 +3363,9 @@ def _download_media(url: str, cancelled=None) -> bytes | None:
         with urlopen(request, timeout=120) as response:
             # Por trozos para poder cortar si el usuario cancela y para no
             # reservar memoria de más en un archivo enorme.
+            total = _size_bytes(response.headers.get("Content-Length"))
+            if progress is not None:
+                progress(0, total)
             while True:
                 if cancelled is not None and cancelled():
                     return None
@@ -3370,18 +3376,29 @@ def _download_media(url: str, cancelled=None) -> bytes | None:
                 if size > YOYO_MAX_UPLOAD:
                     return None
                 chunks.append(chunk)
+                if progress is not None:
+                    progress(size, total)
     except (HTTPError, URLError, TimeoutError, OSError):
         return None
     return b"".join(chunks)
 
 
 async def send_media_safely(
-    message, kind: str, url: str, filename: str, caption: str = "", cancelled=None
+    message,
+    kind: str,
+    url: str,
+    filename: str,
+    caption: str = "",
+    cancelled=None,
+    progress=None,
 ) -> bool:
     """Manda audio, vídeo o documento; si no puede, deja que Telegram lo baje."""
-    blob = await asyncio.to_thread(_download_media, url, cancelled)
+    blob = await asyncio.to_thread(_download_media, url, cancelled, progress)
     if cancelled is not None and cancelled():
         raise DownloadCancelled("Descarga cancelada ⛔️")
+    if progress is not None:
+        # Ya está bajado: vuelve la animación mientras Telegram lo recibe.
+        progress(0, 0)
     if blob:
         try:
             if kind == "audio":
@@ -3416,9 +3433,12 @@ async def send_media_safely(
 # --------------------------------------------------------------------------
 DOWNLOAD_LIMIT = 2  # descargas en marcha a la vez en todo el bot
 DOWNLOAD_USER_PENDING = 2  # descargas pendientes por usuario (1 activa + 1 en cola)
-DOWNLOAD_PANEL_SECONDS = 4  # cada cuánto refresco el mensaje de progreso
+DOWNLOAD_PANEL_SECONDS = 2  # cada cuánto refresco el panel (animación y barra)
+DOWNLOAD_SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+DOWNLOAD_BAR_WIDTH = 14
 
 _DL_ACTIVE = 0
+_DL_TICK = 0  # contador para mover la animación en cada refresco
 _DL_QUEUE: list["DownloadJob"] = []
 _DL_JOBS: dict[str, "DownloadJob"] = {}
 
@@ -3441,6 +3461,22 @@ class DownloadJob:
         self.stage = "Preparando la descarga"
         self.created = time.time()
         self.started = 0.0
+        self.downloaded = 0
+        self.total = 0
+        self.download_started = 0.0
+
+    def begin(self) -> None:
+        """Vuelve a la animación de carga con la barra a cero."""
+        self.downloaded = 0
+        self.total = 0
+        self.download_started = time.time()
+
+    def track(self, done: int, total: int) -> None:
+        """Lo llama la descarga por trozos con lo que lleva y lo que pesa."""
+        self.downloaded = max(0, int(done))
+        self.total = max(0, int(total))
+        if not self.download_started:
+            self.download_started = time.time()
 
 
 async def _dl_acquire(job: DownloadJob) -> bool:
@@ -3465,6 +3501,7 @@ async def _dl_acquire(job: DownloadJob) -> bool:
     _DL_ACTIVE += 1
     job.state = "running"
     job.started = time.time()
+    job.begin()
     return True
 
 
@@ -3503,21 +3540,59 @@ def _dl_position(job: DownloadJob) -> int:
         return 0
 
 
+def _dl_spinner() -> str:
+    """Un fotograma de la animación de carga, distinto en cada refresco."""
+    global _DL_TICK
+    _DL_TICK += 1
+    return DOWNLOAD_SPINNER[_DL_TICK % len(DOWNLOAD_SPINNER)]
+
+
+def _dl_human(num: int) -> str:
+    for unit, size in (("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024)):
+        if num >= size:
+            return f"{num / size:.1f} {unit}"
+    return f"{max(0, int(num))} B"
+
+
+def _dl_bar(job: DownloadJob) -> str:
+    """Barra de progreso real; si no hay tamaño, una franja que se desliza."""
+    width = DOWNLOAD_BAR_WIDTH
+    if job.total <= 0:
+        span = 4
+        pos = _DL_TICK % (width * 2)
+        if pos >= width:
+            pos = width * 2 - pos
+        return "▱" * pos + "▰" * span + "▱" * max(0, width - pos - span)
+    ratio = min(1.0, max(0.0, job.downloaded / job.total))
+    filled = int(ratio * width)
+    return "▰" * filled + "▱" * (width - filled)
+
+
 def _dl_panel_text(job: DownloadJob) -> str:
+    spin = _dl_spinner()
     if job.state == "running":
+        elapsed = pretty_duration(time.time() - job.started)
+        if job.total > 0 and job.downloaded > 0:
+            percent = min(100, int(job.downloaded * 100 / job.total))
+            elapsed_dl = max(0.5, time.time() - (job.download_started or job.started))
+            speed = _dl_human(int(job.downloaded / elapsed_dl))
+            return (
+                f"{spin} Descargando… {percent}%\n"
+                f"{_dl_bar(job)}\n"
+                f"💾 {_dl_human(job.downloaded)} de {_dl_human(job.total)}"
+                f" · {speed}/s · ⏱ {elapsed}"
+            )
         return (
-            "⬇️ Descargando…\n"
-            f"📥 {job.label}\n"
-            f"⚙️ {job.stage} · ⏱ {pretty_duration(time.time() - job.started)}"
+            f"{spin} {job.stage.rstrip('… .')}…\n"
+            f"{_dl_bar(job)}\n"
+            f"⏱ {elapsed}"
         )
     position = _dl_position(job)
     where = f"puesto {position} de {len(_DL_QUEUE)}" if position else "esperando hueco"
     return (
-        "🕒 Tu descarga está en cola\n"
-        f"📥 {job.label}\n"
-        f"👥 {where} · {_DL_ACTIVE}/{DOWNLOAD_LIMIT} descargas activas\n"
-        f"⏳ Llevas {pretty_duration(time.time() - job.created)} esperando\n"
-        "💡 Puedes cancelarla cuando quieras con el botón de abajo."
+        f"{spin} Preparando tu descarga…\n"
+        f"{_dl_bar(job)}\n"
+        f"👥 {where} · ⏳ {pretty_duration(time.time() - job.created)}"
     )
 
 
@@ -3531,6 +3606,10 @@ async def _dl_refresh(job: DownloadJob, panel) -> None:
     while job.state in ("queued", "running"):
         try:
             await panel.edit_text(_dl_panel_text(job), reply_markup=_dl_markup(job))
+        except RetryAfter as exc:
+            # Telegram pide esperar: respeto su tiempo para no inundar el chat.
+            await asyncio.sleep(float(getattr(exc, "retry_after", 5) or 5))
+            continue
         except TelegramError:
             pass
         await asyncio.sleep(DOWNLOAD_PANEL_SECONDS)
@@ -3715,9 +3794,10 @@ async def youtube_download(update: Update, context: ContextTypes.DEFAULT_TYPE, w
             if not candidates:
                 raise CommandError("No hay enlaces de descarga para ese vídeo. Prueba con otro.")
             title = f"{icon} {info.get('title') or 'YouTube'}"
-            job.stage = "Descargando el archivo"
+            job.stage = "Descargando y subiendo el archivo"
             for chosen in candidates[:5]:
                 _dl_check(job)
+                job.begin()
                 extension = str(
                     chosen.get("extension") or ("m4a" if want == "audio" else "mp4")
                 )
@@ -3730,6 +3810,7 @@ async def youtube_download(update: Update, context: ContextTypes.DEFAULT_TYPE, w
                     f"youtube.{extension}",
                     caption,
                     cancelled=_dl_stopped(job),
+                    progress=job.track,
                 ):
                     return
             problems.append("los enlaces de YOSOYYO no descargaron")
@@ -3753,6 +3834,7 @@ async def youtube_download(update: Update, context: ContextTypes.DEFAULT_TYPE, w
                 f"{problems[-1]}\n{exc}" if problems else str(exc)
             )
         job.stage = "Subiendo el archivo a Telegram"
+        job.begin()
         if await send_media_safely(
             message,
             want,
@@ -3760,6 +3842,7 @@ async def youtube_download(update: Update, context: ContextTypes.DEFAULT_TYPE, w
             f"youtube.{fmt}",
             f"{icon} {media['title']}",
             cancelled=_dl_stopped(job),
+            progress=job.track,
         ):
             return
         raise CommandError(
@@ -4886,6 +4969,7 @@ async def on_download_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             job.stage = "Pidiendo el audio a TubeAPI"
             media = await tubeapi_media(video_id, "mp3", cancelled=_dl_stopped(job))
             job.stage = "Subiendo el audio a Telegram"
+            job.begin()
             if not await send_media_safely(
                 message,
                 "audio",
@@ -4893,6 +4977,7 @@ async def on_download_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 "youtube.mp3",
                 f"🎵 {media['title']}",
                 cancelled=_dl_stopped(job),
+                progress=job.track,
             ):
                 raise CommandError(
                     f"No pude subir el audio. Enlace directo:\n{media['url']}"
