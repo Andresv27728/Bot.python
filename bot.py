@@ -76,7 +76,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.27"
+VERSION = "3.29"
 START_TIME = time.time()
 LAST_UPDATE_CHECK = START_TIME
 
@@ -217,7 +217,7 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("facebook", " <enlace>", "descarga un vídeo de Facebook"),
     ("tiktok", " <enlace|búsqueda>", "descarga o busca vídeos de TikTok"),
     ("fbstalk", " <enlace>", "info de un vídeo o perfil de Facebook"),
-    ("mediafire", " <enlace>", "datos y enlace de MediaFire"),
+    ("mediafire", " <enlace>", "descarga un archivo de MediaFire"),
     ("tourl", " <url>", "sube un archivo y devuelve enlaces"),
     ("captura", " <url>", "captura de pantalla de una web"),
     ("ia", " <pregunta>", "pregúntale a la IA DeepSeek"),
@@ -5307,17 +5307,109 @@ async def cmd_fbstalk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.effective_message.reply_text(truncate("\n".join(lines)))
 
 
+MEDIAFIRE_AUDIO = {".mp3", ".m4a", ".ogg", ".opus", ".wav", ".flac", ".aac"}
+MEDIAFIRE_VIDEO = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v"}
+MEDIAFIRE_FILE = re.compile(
+    r"^(?:https?://)?(?:www\.)?mediafire\.com/(?:file|file_premium|view)/"
+    r"([A-Za-z0-9]+)/([^?#]+)",
+    re.I,
+)
+
+
+def mediafire_kind(mime: str, name: str) -> str:
+    """Qué tipo de mensaje le toca según el MIME o la extensión del archivo."""
+    mime = (mime or "").lower()
+    extension = Path(name or "").suffix.lower()
+    if mime.startswith("audio/") or extension in MEDIAFIRE_AUDIO:
+        return "audio"
+    if mime.startswith("video/") or extension in MEDIAFIRE_VIDEO:
+        return "video"
+    return "document"
+
+
+def _mediafire_group(pattern: str, page: str) -> str:
+    match = re.search(pattern, page)
+    return html.unescape(match.group(1)).strip() if match else ""
+
+
+def _mediafire_blocking(link: str) -> dict:
+    """Lee la página del archivo y saca el enlace directo, su nombre y su peso.
+
+    El enlace de la API de YOSOYYO solo vale desde su servidor (MediaFire lo
+    ata a la IP que lo pidió y aquí da 403), así que lo saco yo de la página.
+    """
+    url = link.strip()
+    if not re.match(r"^https?://", url, re.I):
+        url = "https://" + url.lstrip("/")
+    status, body, _ = _fetch_url(
+        url,
+        "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+        40,
+        extra_headers={
+            "Accept-Language": "es-ES,es;q=0.9",
+            "Upgrade-Insecure-Requests": "1",
+        },
+    )
+    if status != 200 or not body:
+        raise CommandError(f"MediaFire respondió HTTP {status}.")
+    page = body.decode("utf-8", "replace")
+    lowered = page.lower()
+    if (
+        "file has been removed" in lowered
+        or "file is unavailable" in lowered
+        or "file you are trying to download is no longer available" in lowered
+    ):
+        raise CommandError("Ese archivo ya no está disponible en MediaFire.")
+    found = (
+        re.search(r'aria-label="Download file"[^>]*href="([^"]+)"', page)
+        or re.search(r'id="downloadButton"[^>]*href="([^"]+)"', page)
+        or re.search(r'href="(https?://download[^"]+)"', page)
+        or re.search(r'href="(//download[^"]+)"', page)
+    )
+    if not found:
+        raise CommandError(
+            "No encontré el enlace de descarga en esa página de MediaFire "
+            "(¿es un enlace de carpeta o el archivo está bloqueado?)."
+        )
+    download = html.unescape(found.group(1)).strip()
+    if download.startswith("//"):
+        download = "https:" + download
+    name = _mediafire_group(r'<div class="filename">([^<]+)</div>', page)
+    if not name:
+        name = Path(unquote(url.split("?")[0].rstrip("/").split("/")[-1])).name
+    size_text = _mediafire_group(r"Download \(([^)]+)\)", page)
+    return {"download": download, "name": name or "mediafire", "size_text": size_text}
+
+
 async def cmd_mediafire(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    link = require_args(context, "/mediafire <enlace del archivo>")
-    result = await yoyo_json("/api/mediafire", {"url": link})
-    if not isinstance(result, dict) or not result.get("downloadLink"):
-        raise CommandError("No pude leer ese archivo de MediaFire.")
-    lines = [
-        f"📦 {result.get('fileName') or 'Archivo'}",
-        f"📏 {result.get('sizeText') or '?'}  •  🗂 {result.get('mimeType') or '?'}",
-        f"🔗 {result.get('downloadLink')}",
-    ]
-    await update.effective_message.reply_text(truncate("\n".join(lines)))
+    link = require_args(
+        context,
+        "/mediafire <enlace del archivo>   ej. "
+        "/mediafire https://www.mediafire.com/file/xxxx/archivo.zip/file",
+    )
+    if not MEDIAFIRE_FILE.match(link.strip()):
+        raise CommandError("Mándame un enlace de archivo de MediaFire (mediafire.com/file/…).")
+    try:
+        info = await asyncio.to_thread(_mediafire_blocking, link)
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        raise CommandError(f"No pude abrir MediaFire: {exc}")
+    name = info["name"]
+    kind = mediafire_kind("", name)
+    caption_lines = [f"📦 {name}"]
+    if info["size_text"]:
+        caption_lines.append(f"📏 {info['size_text']}")
+    caption = truncate("\n".join(caption_lines), 1000)
+    message = update.effective_message
+    async with download_task(update, f"MediaFire · {name[:60]}") as job:
+        job.stage = "Descargando el archivo de MediaFire"
+        ok = await send_media_safely(
+            message, kind, info["download"], name, caption, _dl_stopped(job), job.track
+        )
+        if not ok:
+            raise CommandError(
+                "No pude descargar o enviar ese archivo (¿pasa de 45 MB?). "
+                f"Enlace directo:\n{info['download']}"
+            )
 
 
 async def cmd_tourl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
