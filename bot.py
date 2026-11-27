@@ -59,6 +59,7 @@ from telegram import (
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
     InlineQueryResultPhoto,
+    InputFile,
     InputTextMessageContent,
     Update,
 )
@@ -75,7 +76,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.22"
+VERSION = "3.23"
 START_TIME = time.time()
 LAST_UPDATE_CHECK = START_TIME
 
@@ -193,7 +194,7 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("cerveza", " <nombre>", "cervecerías de Open Brewery DB"),
     ("producto", " <código de barras>", "info nutricional de un producto"),
     ("musica", " <artista>", "ficha de un artista en MusicBrainz"),
-    ("letra", " <artista> - <canción>", "letra de una canción"),
+    ("letra", " <artista> - <canción>", "letra sincronizada (.lrc) de una canción"),
     ("color", " <hex>", "datos de un color (ej. /color 24b1e0)"),
     ("aburrido", "", "una actividad al azar para no aburrirte"),
     ("zorro", "", "foto de un zorro"),
@@ -206,8 +207,8 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("deporte", " <equipo>", "ficha de un equipo (TheSportsDB)"),
     ("covid", " [país]", "datos de COVID-19 de un país o del mundo"),
     ("app", " <búsqueda>", "busca apps en la App Store"),
-    ("mp3", " <enlace|búsqueda>", "descarga el audio de un vídeo de YouTube"),
-    ("mp4", " [calidad] <enlace|búsqueda>", "descarga un vídeo de YouTube (360p, 720p…)"),
+    ("mp3", " <enlace|búsqueda>", "audio con portada, datos y letra sincronizada"),
+    ("mp4", " [calidad] <enlace|búsqueda>", "vídeo con su ficha completa (360p, 720p…)"),
     ("spotify", " <búsqueda>", "busca canciones en Spotify"),
     ("spotifydl", " <enlace>", "descarga una canción de Spotify"),
     ("ytmusic", " <búsqueda>", "busca música en YouTube Music"),
@@ -2783,23 +2784,6 @@ async def cmd_musica(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.effective_message.reply_text(truncate(await music_report(query)))
 
 
-async def lyrics_report(artist: str, title: str) -> str:
-    try:
-        data = await http_json(
-            f"https://api.lyrics.ovh/v1/{quote(artist, safe='')}/{quote(title, safe='')}"
-        )
-    except HTTPError as exc:
-        if exc.code == 404:
-            raise CommandError(
-                f"No encontré la letra de «{title}» de {artist}."
-            ) from exc
-        raise
-    lyrics = data.get("lyrics") if isinstance(data, dict) else None
-    if not lyrics:
-        raise CommandError(f"No encontré la letra de «{title}» de {artist}.")
-    return f"🎶 {artist} — {title}\n\n{lyrics}"
-
-
 async def cmd_letra(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     raw = require_args(
         context, "/letra <artista> - <canción>   ej. /letra shakira - la bicicleta"
@@ -2815,9 +2799,24 @@ async def cmd_letra(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     artist, title = artist.strip(), title.strip()
     if not artist or not title:
         raise CommandError("Me faltó el artista o la canción.")
-    await update.effective_message.reply_text(
-        truncate(await lyrics_report(artist, title))
-    )
+    message = update.effective_message
+    status = await message.reply_text("🎤 Buscando la letra sincronizada…")
+    try:
+        info = await song_metadata(artist, title)
+        info.setdefault("artist", artist)
+        info["artist"] = info.get("artist") or artist
+        info["title"] = info.get("title") or title
+        found = await send_lyrics(message, info)
+    finally:
+        try:
+            await status.delete()
+        except TelegramError:
+            pass
+    if not found:
+        raise CommandError(
+            f"No encontré la letra de «{title}» de {artist}. "
+            "Prueba con el nombre exacto, ej. /letra coldplay - yellow"
+        )
 
 
 async def color_report(value: str) -> str:
@@ -3391,23 +3390,48 @@ async def send_media_safely(
     caption: str = "",
     cancelled=None,
     progress=None,
+    meta: dict | None = None,
+    cover: bytes | None = None,
+    thumb: bytes | None = None,
 ) -> bool:
-    """Manda audio, vídeo o documento; si no puede, deja que Telegram lo baje."""
+    """Manda audio, vídeo o documento; si no puede, deja que Telegram lo baje.
+
+    Con `meta` y `cover` el audio sale etiquetado (título, artista, álbum,
+    portada) y el vídeo lleva su miniatura.
+    """
     blob = await asyncio.to_thread(_download_media, url, cancelled, progress)
     if cancelled is not None and cancelled():
         raise DownloadCancelled("Descarga cancelada ⛔️")
     if progress is not None:
         # Ya está bajado: vuelve la animación mientras Telegram lo recibe.
         progress(0, 0)
+    song = meta or {}
+    if blob and kind == "audio" and song and filename.lower().endswith(".mp3"):
+        # Solo el MP3 lleva ID3; un .m4a se quedaría roto con la etiqueta delante.
+        blob = tag_mp3(blob, song, cover)
+    thumb_bytes = thumb or cover
+    thumbnail = (
+        InputFile(io.BytesIO(thumb_bytes), filename="cover.jpg") if thumb_bytes else None
+    )
     if blob:
         try:
             if kind == "audio":
                 await message.reply_audio(
-                    audio=blob, filename=filename, title=caption[:64] or None
+                    audio=blob,
+                    filename=filename,
+                    caption=caption[:1000] or None,
+                    title=(str(song.get("title") or "") or caption)[:64] or None,
+                    performer=str(song.get("artist") or "")[:64] or None,
+                    duration=int(song["duration"]) if song.get("duration") else None,
+                    thumbnail=thumbnail,
                 )
             elif kind == "video":
                 await message.reply_video(
-                    video=blob, filename=filename, caption=caption[:1000] or None
+                    video=blob,
+                    filename=filename,
+                    caption=caption[:1000] or None,
+                    supports_streaming=True,
+                    thumbnail=thumbnail,
                 )
             else:
                 await message.reply_document(
@@ -3418,14 +3442,32 @@ async def send_media_safely(
             pass
     try:
         if kind == "audio":
-            await message.reply_audio(audio=url, title=caption[:64] or None)
+            await message.reply_audio(
+                audio=url,
+                caption=caption[:1000] or None,
+                title=str(song.get("title") or "")[:64] or caption[:64] or None,
+                performer=str(song.get("artist") or "")[:64] or None,
+                duration=int(song["duration"]) if song.get("duration") else None,
+            )
         elif kind == "video":
-            await message.reply_video(video=url, caption=caption[:1000] or None)
+            await message.reply_video(
+                video=url, caption=caption[:1000] or None, supports_streaming=True
+            )
         else:
             await message.reply_document(document=url, caption=caption[:1000] or None)
         return True
     except TelegramError:
-        return False
+        # Si Telegram rechaza los extras, mando el enlace a secas.
+        try:
+            if kind == "audio":
+                await message.reply_audio(audio=url, caption=caption[:1000] or None)
+            elif kind == "video":
+                await message.reply_video(video=url, caption=caption[:1000] or None)
+            else:
+                await message.reply_document(document=url, caption=caption[:1000] or None)
+            return True
+        except TelegramError:
+            return False
 
 
 # --------------------------------------------------------------------------
@@ -3653,6 +3695,935 @@ async def download_task(update: Update, label: str):
             pass
 
 
+# --------------------------------------------------------------------------
+# Metadatos musicales y letras sincronizadas
+# Varios proveedores y scrapers que se combinan entre sí: iTunes, Deezer,
+# MusicBrainz + Cover Art Archive, la ficha de la página de YouTube, LRCLIB
+# (letra con tiempos) y lyrics.ovh (letra normal) de respaldo.
+# --------------------------------------------------------------------------
+META_TIMEOUT = 18
+COVER_MAX_BYTES = 3 * 1024 * 1024
+MUSIC_TITLE_NOISE = re.compile(
+    r"[\(\[]\s*(?:official|oficial|video|videoclip|audio|lyric|letra|hd|hq|4k|8k|"
+    r"remaster(?:ed)?|visualizer|mv|m/v|en vivo|live|performance)[^\)\]]*[\)\]]",
+    re.I,
+)
+LRC_TIME = re.compile(r"\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]")
+_COVER_CACHE: dict[str, bytes] = {}
+
+
+def split_song_title(raw: str) -> tuple[str, str]:
+    """«Artista - Título (Official Video)» → («Artista», «Título»)."""
+    text = MUSIC_TITLE_NOISE.sub(" ", raw or "")
+    text = re.sub(r"\s+", " ", text).strip(" -–—|•")
+    for separator in (" - ", " – ", " — ", " | ", " • ", " / "):
+        if separator in text:
+            artist, _, title = text.partition(separator)
+            if artist.strip() and title.strip():
+                return artist.strip(), title.strip()
+    return "", text
+
+
+def _similar(left: object, right: object) -> float:
+    """Cuánto se parecen dos nombres, de 0 a 1 (sin tildes ni mayúsculas)."""
+    a, b = fold(str(left or "")), fold(str(right or ""))
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    if a in b or b in a:
+        return 0.8
+    words_a, words_b = set(a.split()), set(b.split())
+    if not words_a or not words_b:
+        return 0.0
+    return len(words_a & words_b) / len(words_a | words_b)
+
+
+def _as_int(value: object) -> int:
+    try:
+        return int(float(str(value).strip() or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _meta_json(url: str, accept: str = "application/json", headers: dict | None = None) -> object:
+    """GET que devuelve JSON ya parseado (lanza si la respuesta no sirve)."""
+    status, body, _ = _fetch_url(url, accept, META_TIMEOUT, extra_headers=headers)
+    if status != 200 or not body:
+        raise CommandError(f"HTTP {status}")
+    return json.loads(body.decode("utf-8", "replace"))
+
+
+async def _meta_call(name: str, label: str, func, *args) -> list[dict]:
+    """Llama a un proveedor en un hilo y apunta su salud para /salud."""
+    check_provider(name)
+    try:
+        items = await asyncio.to_thread(func, *args)
+    except (CommandError, HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+        provider_fail(name, label, exc)
+        return []
+    provider_ok(name, label)
+    return items if isinstance(items, list) else []
+
+
+# ---- 1) iTunes Search API (sin clave) ------------------------------------
+def _itunes_blocking(term: str) -> list[dict]:
+    data = _meta_json(
+        _build_url(
+            "https://itunes.apple.com/search",
+            {"term": term, "entity": "song", "media": "music", "limit": 8},
+        )
+    )
+    found: list[dict] = []
+    for item in (data.get("results") if isinstance(data, dict) else []) or []:
+        if not isinstance(item, dict) or not item.get("trackName"):
+            continue
+        artwork = str(item.get("artworkUrl100") or "")
+        artwork = re.sub(r"/\d+x\d+bb\.", "/1000x1000bb.", artwork)
+        found.append(
+            {
+                "title": str(item.get("trackName") or ""),
+                "artist": str(item.get("artistName") or ""),
+                "album": str(item.get("collectionName") or ""),
+                "year": str(item.get("releaseDate") or "")[:4],
+                "genre": str(item.get("primaryGenreName") or ""),
+                "track": _as_int(item.get("trackNumber")),
+                "total_tracks": _as_int(item.get("trackCount")),
+                "duration": _as_int(item.get("trackTimeMillis")) // 1000,
+                "cover_url": artwork if artwork.startswith("http") else "",
+                "source": "iTunes",
+            }
+        )
+    return found
+
+
+# ---- 2) Deezer (sin clave) -----------------------------------------------
+def _deezer_blocking(artist: str, title: str) -> list[dict]:
+    query = f'track:"{title}"'
+    if artist:
+        query += f' artist:"{artist}"'
+    data = _meta_json(
+        _build_url("https://api.deezer.com/search", {"q": query, "limit": 8})
+    )
+    found: list[dict] = []
+    for item in (data.get("data") if isinstance(data, dict) else []) or []:
+        if not isinstance(item, dict) or not item.get("title"):
+            continue
+        album = item.get("album") if isinstance(item.get("album"), dict) else {}
+        who = item.get("artist") if isinstance(item.get("artist"), dict) else {}
+        found.append(
+            {
+                "title": str(item.get("title") or ""),
+                "artist": str(who.get("name") or ""),
+                "album": str(album.get("title") or ""),
+                "year": "",
+                "genre": "",
+                "track": 0,
+                "total_tracks": 0,
+                "duration": _as_int(item.get("duration")),
+                "cover_url": str(album.get("cover_xl") or album.get("cover_big") or ""),
+                "album_id": str(album.get("id") or ""),
+                "source": "Deezer",
+            }
+        )
+    return found
+
+
+def _deezer_album_blocking(album_id: str) -> dict:
+    data = _meta_json(f"https://api.deezer.com/album/{album_id}")
+    if not isinstance(data, dict):
+        return {}
+    genres = data.get("genres") if isinstance(data.get("genres"), dict) else {}
+    names = [
+        str(entry.get("name"))
+        for entry in (genres.get("data") or [])
+        if isinstance(entry, dict) and entry.get("name")
+    ]
+    return {
+        "year": str(data.get("release_date") or "")[:4],
+        "genre": ", ".join(names[:2]),
+        "total_tracks": _as_int(data.get("nb_tracks")),
+        "cover_url": str(data.get("cover_xl") or ""),
+        "label": str(data.get("label") or ""),
+        "album": str(data.get("title") or ""),
+    }
+
+
+# ---- 3) MusicBrainz + Cover Art Archive ----------------------------------
+MUSICBRAINZ_HEADERS = {
+    "User-Agent": f"BotPython/{VERSION} (https://github.com/Andresv27728/Bot.python)"
+}
+
+
+def _musicbrainz_blocking(artist: str, title: str) -> list[dict]:
+    query = f'recording:"{title}"'
+    if artist:
+        query += f' AND artist:"{artist}"'
+    data = _meta_json(
+        _build_url(
+            "https://musicbrainz.org/ws/2/recording",
+            {"query": query, "fmt": "json", "limit": 8},
+        ),
+        headers=MUSICBRAINZ_HEADERS,
+    )
+    found: list[dict] = []
+    for item in (data.get("recordings") if isinstance(data, dict) else []) or []:
+        if not isinstance(item, dict) or not item.get("title"):
+            continue
+        credits = item.get("artist-credit") or []
+        who = ""
+        if credits and isinstance(credits[0], dict):
+            who = str((credits[0].get("artist") or {}).get("name") or "")
+        releases = [entry for entry in (item.get("releases") or []) if isinstance(entry, dict)]
+        release = releases[0] if releases else {}
+        groups = release.get("release-group") if isinstance(release.get("release-group"), dict) else {}
+        found.append(
+            {
+                "title": str(item.get("title") or ""),
+                "artist": who,
+                "album": str(release.get("title") or ""),
+                "year": str(release.get("date") or "")[:4],
+                "genre": "",
+                "track": 0,
+                "total_tracks": 0,
+                "duration": _as_int(item.get("length")) // 1000,
+                "cover_url": "",
+                "release_id": str(release.get("id") or ""),
+                "kind": str(groups.get("primary-type") or ""),
+                "source": "MusicBrainz",
+            }
+        )
+    return found
+
+
+# ---- Portadas ------------------------------------------------------------
+def _cover_blocking(url: str) -> bytes | None:
+    try:
+        status, body, content_type = _fetch_url(
+            url, "image/jpeg,image/png,image/*;q=0.8", META_TIMEOUT
+        )
+    except (HTTPError, URLError, TimeoutError, OSError):
+        return None
+    if status != 200 or not body or len(body) > COVER_MAX_BYTES:
+        return None
+    looks_image = body[:3] == b"\xff\xd8\xff" or body[:8].startswith(b"\x89PNG")
+    if not looks_image and not content_type.lower().startswith("image/"):
+        return None
+    return body
+
+
+async def song_cover(info: dict) -> bytes | None:
+    """Baja la portada: la del proveedor que la tenga o la de Cover Art Archive."""
+    urls: list[str] = []
+    if info.get("cover_url"):
+        urls.append(str(info["cover_url"]))
+    if info.get("release_id"):
+        urls.append(f"https://coverartarchive.org/release/{info['release_id']}/front-500")
+    if not urls:
+        return None
+    key = fold(f"{info.get('artist')}|{info.get('album') or info.get('title')}")
+    if key in _COVER_CACHE:
+        return _COVER_CACHE[key]
+    for url in urls:
+        cover = await asyncio.to_thread(_cover_blocking, url)
+        if cover:
+            if len(_COVER_CACHE) > 120:
+                _COVER_CACHE.clear()
+            _COVER_CACHE[key] = cover
+            return cover
+    return None
+
+
+def _thumbnail(cover: bytes | None) -> bytes | None:
+    """Miniatura cuadrada de 320 px en JPEG (lo que pide Telegram)."""
+    if not cover:
+        return None
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(cover)) as raw:
+            image = raw.convert("RGB")
+        image.thumbnail((320, 320))
+        out = io.BytesIO()
+        image.save(out, format="JPEG", quality=85)
+        data = out.getvalue()
+        return data if len(data) < 200 * 1024 else None
+    except Exception:
+        return None
+
+
+# ---- 4) Ficha de YouTube (scraper + oEmbed de respaldo) ------------------
+def _json_after(page: str, marker: str) -> dict:
+    """Saca el JSON que hay justo después de un marcador del HTML."""
+    index = page.find(marker)
+    if index < 0:
+        return {}
+    start = page.find("{", index)
+    if start < 0:
+        return {}
+    try:
+        payload, _ = json.JSONDecoder().raw_decode(page[start:])
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _dig(node: object, key: str, depth: int = 0) -> object:
+    """Busca una clave a cualquier profundidad dentro del JSON de YouTube."""
+    if depth > 10:
+        return None
+    if isinstance(node, dict):
+        if key in node:
+            return node[key]
+        for value in node.values():
+            found = _dig(value, key, depth + 1)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for value in node[:40]:
+            found = _dig(value, key, depth + 1)
+            if found is not None:
+                return found
+    return None
+
+
+def _text_of(node: object) -> str:
+    """Texto de un nodo de YouTube: simpleText, runs o cadena."""
+    if isinstance(node, dict):
+        if node.get("simpleText"):
+            return str(node["simpleText"]).strip()
+        runs = node.get("runs")
+        if isinstance(runs, list):
+            return "".join(
+                str(item.get("text") or "") for item in runs if isinstance(item, dict)
+            ).strip()
+    if isinstance(node, str):
+        return node.strip()
+    return ""
+
+
+SPANISH_MONTHS = {
+    "ene": 1, "feb": 2, "mar": 3, "abr": 4, "may": 5, "jun": 6,
+    "jul": 7, "ago": 8, "sep": 9, "set": 9, "oct": 10, "nov": 11, "dic": 12,
+}
+
+
+def _spanish_date(text: str) -> str:
+    """«30 may 2011» → «2011-05-30»."""
+    match = re.search(r"(\d{1,2})\s+([A-Za-zÁÉÍÓÚáéíóú]{3,})\.?\s+(?:de\s+)?(\d{4})", text or "")
+    if not match:
+        return ""
+    month = SPANISH_MONTHS.get(fold(match.group(2))[:3])
+    if not month:
+        return ""
+    return f"{match.group(3)}-{month:02d}-{int(match.group(1)):02d}"
+
+
+def _stamp(value: object) -> str:
+    """Convierte un timestamp (segundos o milisegundos) en fecha legible."""
+    number = _as_int(value)
+    if not number:
+        return ""
+    if number > 10 ** 11:
+        number //= 1000
+    try:
+        return datetime.fromtimestamp(number, timezone.utc).strftime("%Y-%m-%d")
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+
+def _youtube_details_blocking(video_id: str) -> list[dict]:
+    """Scraper de la página del vídeo: player, datos iniciales y microformat."""
+    url = f"https://www.youtube.com/watch?v={video_id}&hl=es&gl=ES"
+    status, body, _ = _fetch_url(
+        url,
+        "text/html,application/xhtml+xml",
+        META_TIMEOUT,
+        extra_headers={"Accept-Language": "es-ES,es;q=0.9"},
+    )
+    page = body.decode("utf-8", "replace") if body else ""
+    if status != 200 or not page:
+        raise CommandError(f"HTTP {status}")
+    player = _json_after(page, "ytInitialPlayerResponse")
+    data = _json_after(page, "ytInitialData")
+    video = player.get("videoDetails") if isinstance(player.get("videoDetails"), dict) else {}
+    micro = (player.get("microformat") or {}).get("playerMicroformatRenderer") or {}
+    primary = _dig(data, "videoPrimaryInfoRenderer") or {}
+    secondary = _dig(data, "videoSecondaryInfoRenderer") or {}
+    owner = ((secondary.get("owner") or {}).get("videoOwnerRenderer") or {})
+    views_block = ((primary.get("viewCount") or {}).get("videoViewCountRenderer") or {})
+    views = _as_int(video.get("viewCount")) or _as_int(views_block.get("originalViewCount"))
+    if not views:
+        digits = re.sub(r"[^0-9]", "", _text_of(views_block.get("viewCount")))
+        views = _as_int(digits)
+    thumbs = ((video.get("thumbnail") or {}).get("thumbnails") or [])
+    best_thumb = ""
+    if thumbs and isinstance(thumbs[-1], dict):
+        best_thumb = str(thumbs[-1].get("url") or "")
+    result = {
+        "title": str(video.get("title") or _text_of(primary.get("title")) or ""),
+        "channel": str(
+            video.get("author")
+            or micro.get("ownerChannelName")
+            or _text_of(owner.get("title"))
+            or ""
+        ),
+        "duration": _as_int(video.get("lengthSeconds")) or _as_int(micro.get("lengthSeconds")),
+        "views": views,
+        "published": str(micro.get("publishDate") or micro.get("uploadDate") or "")[:10]
+        or _spanish_date(_text_of(primary.get("dateText"))),
+        "category": str(micro.get("category") or ""),
+        "description": str(video.get("shortDescription") or "")[:400],
+        "thumbnail": best_thumb
+        or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+        "video_id": video_id,
+        "source": "YouTube",
+    }
+    if not result["title"]:
+        raise CommandError("YouTube no dejó leer la ficha de ese vídeo")
+    return [result]
+
+
+INVIDIOUS_HOSTS = (
+    "https://inv.nadeko.net",
+    "https://invidious.nerdvpn.de",
+    "https://yewtu.be",
+)
+PIPED_HOSTS = (
+    "https://pipedapi.kavin.rocks",
+    "https://pipedapi.adminforge.de",
+    "https://api.piped.private.coffee",
+)
+
+
+def _invidious_blocking(video_id: str) -> list[dict]:
+    """Instancias públicas de Invidious: ficha completa sin tocar YouTube."""
+    for host in INVIDIOUS_HOSTS:
+        try:
+            status, body, _ = _fetch_url(
+                f"{host}/api/v1/videos/{video_id}", "application/json", 8
+            )
+        except (HTTPError, URLError, TimeoutError, OSError):
+            continue
+        if status != 200 or not body:
+            continue
+        try:
+            data = json.loads(body.decode("utf-8", "replace"))
+        except ValueError:
+            continue
+        if not isinstance(data, dict) or not data.get("title"):
+            continue
+        thumbs = data.get("videoThumbnails") or []
+        thumbnail = ""
+        if thumbs:
+            best = max(
+                (item for item in thumbs if isinstance(item, dict)),
+                key=lambda item: _as_int(item.get("width")),
+                default={},
+            )
+            thumbnail = str(best.get("url") or "")
+        return [
+            {
+                "title": str(data.get("title") or ""),
+                "channel": str(data.get("author") or ""),
+                "duration": _as_int(data.get("lengthSeconds")),
+                "views": _as_int(data.get("viewCount")),
+                "published": _stamp(data.get("published")),
+                "category": str(data.get("genre") or ""),
+                "description": str(data.get("description") or "")[:400],
+                "thumbnail": thumbnail,
+                "video_id": video_id,
+                "source": "Invidious",
+            }
+        ]
+    raise CommandError("Ninguna instancia de Invidious respondió")
+
+
+def _piped_blocking(video_id: str) -> list[dict]:
+    """API de Piped (otra puerta a los datos del vídeo)."""
+    for host in PIPED_HOSTS:
+        try:
+            status, body, _ = _fetch_url(
+                f"{host}/streams/{video_id}", "application/json", 10
+            )
+        except (HTTPError, URLError, TimeoutError, OSError):
+            continue
+        if status != 200 or not body:
+            continue
+        try:
+            data = json.loads(body.decode("utf-8", "replace"))
+        except ValueError:
+            continue
+        if not isinstance(data, dict) or not data.get("title"):
+            continue
+        return [
+            {
+                "title": str(data.get("title") or ""),
+                "channel": str(data.get("uploader") or data.get("uploaderName") or ""),
+                "duration": _as_int(data.get("duration")),
+                "views": _as_int(data.get("views")),
+                "published": _stamp(data.get("uploaded") or data.get("uploadDate")),
+                "category": str(data.get("category") or ""),
+                "description": str(data.get("description") or "")[:400],
+                "thumbnail": str(data.get("thumbnailUrl") or ""),
+                "video_id": video_id,
+                "source": "Piped",
+            }
+        ]
+    raise CommandError("Ninguna instancia de Piped respondió")
+
+
+def _oembed_blocking(video_id: str) -> list[dict]:
+    """oEmbed de YouTube y noembed: siempre dan título, canal y miniatura."""
+    watch = f"https://www.youtube.com/watch?v={video_id}"
+    urls = (
+        _build_url("https://www.youtube.com/oembed", {"url": watch, "format": "json"}),
+        _build_url("https://noembed.com/embed", {"url": watch}),
+    )
+    for url in urls:
+        try:
+            status, body, _ = _fetch_url(url, "application/json", 12)
+        except (HTTPError, URLError, TimeoutError, OSError):
+            continue
+        if status != 200 or not body:
+            continue
+        try:
+            data = json.loads(body.decode("utf-8", "replace"))
+        except ValueError:
+            continue
+        if not isinstance(data, dict) or not data.get("title"):
+            continue
+        return [
+            {
+                "title": str(data.get("title") or ""),
+                "channel": str(data.get("author_name") or ""),
+                "thumbnail": str(data.get("thumbnail_url") or ""),
+                "video_id": video_id,
+                "source": "oEmbed",
+            }
+        ]
+    raise CommandError("oEmbed no respondió")
+
+
+async def youtube_details(video_id: str) -> dict:
+    """Ficha del vídeo juntando scraper, Invidious, Piped y oEmbed."""
+    groups = await asyncio.gather(
+        _meta_call("youtube", "YouTube (ficha)", _youtube_details_blocking, video_id),
+        _meta_call("invidious", "Invidious", _invidious_blocking, video_id),
+        _meta_call("piped", "Piped", _piped_blocking, video_id),
+        _meta_call("oembed", "oEmbed", _oembed_blocking, video_id),
+        return_exceptions=True,
+    )
+    info: dict = {}
+    sources: list[str] = []
+    for group in groups:
+        if not isinstance(group, list):
+            continue
+        for item in group:
+            if not isinstance(item, dict):
+                continue
+            for key, value in item.items():
+                if value and not info.get(key):
+                    info[key] = value
+            if item.get("source"):
+                sources.append(str(item["source"]))
+    if not info.get("title"):
+        return {}
+    info.setdefault("thumbnail", f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg")
+    info["video_id"] = video_id
+    info["providers"] = " · ".join(dict.fromkeys(sources))
+    return info
+
+
+async def video_cover(details: dict) -> bytes | None:
+    """Miniatura del vídeo, recortada al tamaño que acepta Telegram."""
+    candidates = [
+        str(details.get("thumbnail") or ""),
+        f"https://i.ytimg.com/vi/{details.get('video_id')}/hqdefault.jpg",
+    ]
+    for url in candidates:
+        if not url.startswith("http"):
+            continue
+        cover = await asyncio.to_thread(_cover_blocking, url)
+        if cover:
+            return _thumbnail(cover)
+    return None
+
+
+# ---- Combinar los proveedores -------------------------------------------
+async def song_metadata(
+    artist: str, title: str, album: str = "", duration: int = 0, job=None
+) -> dict:
+    """Pregunta a iTunes, Deezer y MusicBrainz y junta lo mejor de cada uno."""
+    title = (title or "").strip()
+    artist = (artist or "").strip()
+    term = f"{artist} {title}".strip() or title
+    if not term:
+        return {}
+    if job is not None:
+        job.stage = "Buscando portada, álbum y artista"
+    groups = await asyncio.gather(
+        _meta_call("itunes", "iTunes", _itunes_blocking, term),
+        _meta_call("deezer", "Deezer", _deezer_blocking, artist, title),
+        _meta_call("musicbrainz", "MusicBrainz", _musicbrainz_blocking, artist, title),
+        return_exceptions=True,
+    )
+    candidates: list[dict] = []
+    for group in groups:
+        if isinstance(group, list):
+            candidates.extend(item for item in group if isinstance(item, dict))
+    best: dict = {}
+    best_score = 0.0
+    for item in candidates:
+        score = 2 * _similar(item.get("title"), title) + _similar(item.get("artist"), artist)
+        if duration and item.get("duration"):
+            score += 0.5 if abs(_as_int(item["duration"]) - duration) <= 8 else -0.3
+        if score > best_score:
+            best, best_score = item, score
+    if not best:
+        return {"title": title, "artist": artist, "album": album, "duration": duration}
+    info = {
+        "title": str(best.get("title") or title),
+        "artist": str(best.get("artist") or artist),
+        "album": str(best.get("album") or album),
+        "year": str(best.get("year") or ""),
+        "genre": str(best.get("genre") or ""),
+        "track": _as_int(best.get("track")),
+        "total_tracks": _as_int(best.get("total_tracks")),
+        "duration": _as_int(best.get("duration")) or duration,
+        "cover_url": str(best.get("cover_url") or ""),
+        "release_id": str(best.get("release_id") or ""),
+        "album_id": str(best.get("album_id") or ""),
+    }
+    sources = {str(best.get("source") or "")} - {""}
+    # Rellenar los huecos con el resto de proveedores.
+    for item in candidates:
+        if _similar(item.get("title"), info["title"]) < 0.6:
+            continue
+        for key in (
+            "album", "year", "genre", "track", "total_tracks",
+            "cover_url", "release_id", "album_id", "duration",
+        ):
+            if not info.get(key) and item.get(key):
+                info[key] = item[key]
+                if item.get("source"):
+                    sources.add(str(item["source"]))
+    if info["album_id"] and (not info["year"] or not info["genre"] or not info["total_tracks"]):
+        extra = await _meta_call(
+            "deezer", "Deezer", _deezer_album_blocking, str(info["album_id"])
+        )
+        if extra and isinstance(extra[0], dict):
+            for key, value in extra[0].items():
+                if value and not info.get(key):
+                    info[key] = value
+            sources.add("Deezer (álbum)")
+    if job is not None:
+        job.stage = "Bajando la portada"
+    info["cover"] = await song_cover(info)
+    info["providers"] = " · ".join(sorted(sources)) or "—"
+    return info
+
+
+# ---- Etiquetas ID3 (título, artista, álbum, año, pista y portada) --------
+def _syncsafe(value: int) -> bytes:
+    return bytes(
+        [(value >> 21) & 0x7F, (value >> 14) & 0x7F, (value >> 7) & 0x7F, value & 0x7F]
+    )
+
+
+def _id3_frame(frame_id: str, payload: bytes) -> bytes:
+    return frame_id.encode("ascii") + len(payload).to_bytes(4, "big") + b"\x00\x00" + payload
+
+
+def _id3_text(frame_id: str, value: str) -> bytes:
+    return _id3_frame(frame_id, b"\x01" + value.encode("utf-16"))
+
+
+def tag_mp3(blob: bytes, info: dict, cover: bytes | None = None) -> bytes:
+    """Escribe una etiqueta ID3v2.3 en el MP3 con todos los datos y la portada."""
+    if not blob or blob.startswith(b"ID3") or not info:
+        return blob
+    frames: list[bytes] = []
+    title = str(info.get("title") or "").strip()
+    artist = str(info.get("artist") or "").strip()
+    album = str(info.get("album") or "").strip()
+    if title:
+        frames.append(_id3_text("TIT2", title))
+    if artist:
+        frames.append(_id3_text("TPE1", artist))
+    if album:
+        frames.append(_id3_text("TALB", album))
+    if info.get("year"):
+        frames.append(_id3_text("TYER", str(info["year"])[:4]))
+    if info.get("genre"):
+        frames.append(_id3_text("TCON", str(info["genre"])))
+    if info.get("track"):
+        total = _as_int(info.get("total_tracks"))
+        frames.append(
+            _id3_text("TRCK", f"{info['track']}/{total}" if total else str(info["track"]))
+        )
+    if cover:
+        mime = b"image/png" if cover[:8].startswith(b"\x89PNG") else b"image/jpeg"
+        frames.append(
+            _id3_frame("APIC", b"\x00" + mime + b"\x00" + b"\x03" + b"\x00" + cover)
+        )
+    if not frames:
+        return blob
+    body = b"".join(frames)
+    tag = b"ID3\x03\x00\x00" + _syncsafe(len(body)) + body
+    return tag + blob
+
+
+def song_filename(info: dict, fallback: str = "audio.mp3") -> str:
+    title = str(info.get("title") or "").strip()
+    if not title:
+        return fallback
+    name = f"{info.get('artist') or ''} - {title}".strip(" -")
+    name = re.sub(r'[\\/:*?"<>|\n\r\t]', " ", name)
+    name = re.sub(r"\s+", " ", name).strip()[:90] or title[:90]
+    extension = fallback.rsplit(".", 1)[-1] if "." in fallback else "mp3"
+    return f"{name}.{extension}"
+
+
+def song_caption(info: dict, extra: str = "") -> str:
+    title = str(info.get("title") or "Audio")
+    artist = str(info.get("artist") or "")
+    lines = [f"🎵 {title}" + (f" — {artist}" if artist else "")]
+    album, year = str(info.get("album") or ""), str(info.get("year") or "")
+    if album:
+        lines.append(f"💿 {album}" + (f" ({year})" if year else ""))
+    elif year:
+        lines.append(f"📅 {year}")
+    track, total = _as_int(info.get("track")), _as_int(info.get("total_tracks"))
+    details = []
+    if info.get("genre"):
+        details.append(str(info["genre"]))
+    if track:
+        details.append(f"pista {track}" + (f" de {total}" if total else ""))
+    if info.get("duration"):
+        details.append(pretty_duration(_as_int(info["duration"])))
+    if details:
+        lines.append("🎼 " + " · ".join(details))
+    if extra:
+        lines.append(extra)
+    if info.get("cover"):
+        lines.append("🖼 Portada incluida en la carátula y en las etiquetas del MP3")
+    if info.get("providers"):
+        lines.append(f"🔎 Datos: {info['providers']}")
+    return "\n".join(lines)
+
+
+def video_caption(details: dict, resolution: int = 0) -> str:
+    title = str(details.get("title") or "Vídeo de YouTube")
+    lines = [f"🎬 {title}"]
+    if details.get("channel"):
+        lines.append(f"👤 {details['channel']}")
+    bits = []
+    if resolution:
+        bits.append(f"{resolution}p")
+    if details.get("duration"):
+        bits.append(pretty_duration(_as_int(details["duration"])))
+    if details.get("views"):
+        bits.append(f"{int(details['views']):,} visitas".replace(",", "."))
+    if details.get("published"):
+        bits.append(f"publicado el {details['published']}")
+    if details.get("category"):
+        bits.append(str(details["category"]))
+    if bits:
+        lines.append("📊 " + " · ".join(bits))
+    if details.get("providers"):
+        lines.append(f"🔎 Datos: {details['providers']}")
+    return "\n".join(lines)
+
+
+# ---- Letras: LRCLIB (con tiempos) y lyrics.ovh de respaldo --------------
+def _lrclib_blocking(artist: str, title: str, album: str = "", duration: int = 0) -> list[dict]:
+    params: dict = {"track_name": title}
+    if artist:
+        params["artist_name"] = artist
+    if album:
+        params["album_name"] = album
+    if duration:
+        params["duration"] = duration
+    try:
+        data = _meta_json(_build_url("https://lrclib.net/api/get", params))
+        if isinstance(data, dict) and (data.get("syncedLyrics") or data.get("plainLyrics")):
+            return [data]
+    except (CommandError, HTTPError, URLError, TimeoutError, OSError, ValueError):
+        pass
+    search: dict = {"q": f"{artist} {title}".strip() or title}
+    if artist:
+        search["artist_name"] = artist
+    search["track_name"] = title
+    data = _meta_json(_build_url("https://lrclib.net/api/search", search))
+    return [item for item in (data if isinstance(data, list) else []) if isinstance(item, dict)]
+
+
+def _lyrics_ovh_blocking(artist: str, title: str) -> list[dict]:
+    data = _meta_json(
+        f"https://api.lyrics.ovh/v1/{quote(artist, safe='')}/{quote(title, safe='')}"
+    )
+    text = data.get("lyrics") if isinstance(data, dict) else ""
+    if not text:
+        raise CommandError("La letra no está en lyrics.ovh")
+    return [{"plainLyrics": str(text), "syncedLyrics": "", "source": "lyrics.ovh"}]
+
+
+def parse_lrc(text: str) -> list[tuple[float, str]]:
+    """Convierte un LRC en [(segundos, línea)] ordenado, respetando el offset."""
+    entries: list[tuple[float, str]] = []
+    offset = 0.0
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.lower().startswith("[offset:"):
+            numbers = re.findall(r"-?\d+", line)
+            offset = _as_int(numbers[0]) / 1000 if numbers else 0.0
+            continue
+        stamps = LRC_TIME.findall(line)
+        if not stamps:
+            continue
+        content = LRC_TIME.sub("", line).strip()
+        if not content:
+            continue
+        for minutes, seconds, fraction in stamps:
+            ms = _as_int(fraction.ljust(3, "0")) if fraction else 0
+            entries.append(
+                (max(0.0, int(minutes) * 60 + int(seconds) + ms / 1000 + offset), content)
+            )
+    entries.sort(key=lambda pair: pair[0])
+    return entries
+
+
+def lrc_preview(lines: list[tuple[float, str]], limit: int = 16) -> str:
+    shown = []
+    for seconds, text in lines[:limit]:
+        stamp = f"{int(seconds) // 60:02d}:{int(seconds) % 60:02d}"
+        shown.append(f"[{stamp}] {text}")
+    if len(lines) > limit:
+        shown.append(f"… y {len(lines) - limit} líneas más en el archivo .lrc")
+    return "\n".join(shown)
+
+
+async def synced_lyrics(artist: str, title: str, album: str = "", duration: int = 0) -> dict:
+    """Letra con tiempos (LRCLIB) o, si no hay, letra normal (lyrics.ovh)."""
+    result = {"synced": "", "plain": "", "lines": [], "source": ""}
+    items = await _meta_call("lrclib", "LRCLIB (letras)", _lrclib_blocking, artist, title, album, duration)
+    if not items:
+        items = []
+    best = None
+    for item in items:
+        if item.get("syncedLyrics"):
+            if best is None or (
+                duration and item.get("duration")
+                and abs(_as_int(item["duration"]) - duration) < abs(_as_int(best.get("duration")) - duration)
+            ):
+                best = item
+    if best is None:
+        best = next((item for item in items if item.get("plainLyrics")), None)
+    if best:
+        result["synced"] = str(best.get("syncedLyrics") or "")
+        result["plain"] = str(best.get("plainLyrics") or "")
+        result["lines"] = parse_lrc(result["synced"]) if result["synced"] else []
+        result["source"] = "LRCLIB"
+    if not result["synced"] and not result["plain"]:
+        extra = await _meta_call(
+            "lyricsovh", "lyrics.ovh", _lyrics_ovh_blocking, artist, title
+        )
+        if extra and isinstance(extra[0], dict):
+            result["plain"] = str(extra[0].get("plainLyrics") or "")
+            result["source"] = "lyrics.ovh"
+    return result
+
+
+def lrc_filename(artist: str, title: str) -> str:
+    name = f"{artist or ''} - {title or 'letra'}".strip(" -")
+    name = re.sub(r'[\\/:*?"<>|\n\r\t]', " ", name)
+    return re.sub(r"\s+", " ", name).strip()[:90] + ".lrc"
+
+
+async def send_lyrics(message, info: dict, job=None) -> bool:
+    """Manda la letra sincronizada: archivo .lrc + un adelanto con tiempos."""
+    artist = str(info.get("artist") or "")
+    title = str(info.get("title") or "")
+    if not title:
+        return False
+    if job is not None:
+        job.stage = "Buscando la letra sincronizada"
+    try:
+        lyrics = await synced_lyrics(artist, title, str(info.get("album") or ""), _as_int(info.get("duration")))
+    except CommandError:
+        return False
+    header = f"🎤 {title}" + (f" — {artist}" if artist else "")
+    if lyrics.get("synced"):
+        try:
+            await message.reply_document(
+                document=lyrics["synced"].encode("utf-8"),
+                filename=lrc_filename(artist, title),
+                caption=f"{header}\n🎼 Letra sincronizada (.lrc) · {lyrics['source']}",
+            )
+        except TelegramError:
+            pass
+        preview = lrc_preview(lyrics["lines"])
+        try:
+            await message.reply_text(
+                truncate(f"{header}\n🎼 Letra sincronizada\n\n{preview}")
+            )
+        except TelegramError:
+            return False
+        return True
+    if lyrics.get("plain"):
+        try:
+            await message.reply_text(
+                truncate(
+                    f"{header}\n🎼 Letra (sin tiempos) · {lyrics['source']}\n\n{lyrics['plain']}"
+                )
+            )
+        except TelegramError:
+            return False
+        return True
+    return False
+
+
+async def send_song(
+    message,
+    url: str,
+    artist: str,
+    title: str,
+    album: str = "",
+    duration: int = 0,
+    filename: str = "audio.mp3",
+    job=None,
+    cancelled=None,
+    progress=None,
+    extra: str = "",
+    with_lyrics: bool = True,
+) -> bool:
+    """Baja un audio, le pone portada, etiquetas, datos y su letra sincronizada."""
+    info = await song_metadata(artist, title, album, duration, job=job)
+    if job is not None:
+        job.stage = "Etiquetando el audio con la portada y los datos"
+    cover = info.get("cover") if isinstance(info.get("cover"), bytes) else None
+    caption = song_caption(info, extra)
+    info.pop("cover", None)
+    ok = await send_media_safely(
+        message,
+        "audio",
+        url,
+        song_filename(info, filename),
+        caption,
+        cancelled,
+        progress,
+        info,
+        cover,
+        _thumbnail(cover),
+    )
+    if ok and with_lyrics:
+        await send_lyrics(message, info, job)
+    return ok
+
+
 def find_youtube_url(text: str) -> str | None:
     match = re.search(
         r"((?:https?://)?(?:www\.|m\.)?(?:youtube\.com|youtu\.be)/[^\s]+)", text, re.I
@@ -3780,11 +4751,33 @@ async def youtube_download(update: Update, context: ContextTypes.DEFAULT_TYPE, w
         height = None
     message = update.effective_message
     fmt = "mp3" if want == "audio" else "mp4"
-    icon = "🎵" if want == "audio" else "🎬"
     label = f"{fmt.upper()} · {target[:70]}"
     problems: list[str] = []
     async with download_task(update, label) as job:
         link = await youtube_link(target)
+        video_id = youtube_video_id(link) or youtube_video_id(target)
+        job.stage = "Leyendo la ficha del vídeo"
+        details: dict = {}
+        if video_id:
+            try:
+                details = await youtube_details(video_id)
+            except CommandError:
+                details = {}
+            if not details.get("thumbnail"):
+                details["thumbnail"] = f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg"
+            details["video_id"] = video_id
+        video_thumb = await video_cover(details) if details and want == "video" else None
+
+        def audio_parts(source_title: str) -> tuple[str, str, str]:
+            artist_guess, title_guess = split_song_title(source_title)
+            channel = str(details.get("channel") or "")
+            extra = (
+                f"▶️ YouTube: {channel}"
+                if channel and fold(channel) != fold(artist_guess)
+                else ""
+            )
+            return artist_guess, title_guess, extra
+
         job.stage = "Pidiendo los enlaces a YOSOYYO"
         try:
             info = await yoyo_json("/api/youtube/v2", {"url": link, "format": fmt})
@@ -3793,7 +4786,7 @@ async def youtube_download(update: Update, context: ContextTypes.DEFAULT_TYPE, w
             candidates = youtube_candidates(info, want, height)
             if not candidates:
                 raise CommandError("No hay enlaces de descarga para ese vídeo. Prueba con otro.")
-            title = f"{icon} {info.get('title') or 'YouTube'}"
+            full_title = str(details.get("title") or info.get("title") or target)
             job.stage = "Descargando y subiendo el archivo"
             for chosen in candidates[:5]:
                 _dl_check(job)
@@ -3802,16 +4795,33 @@ async def youtube_download(update: Update, context: ContextTypes.DEFAULT_TYPE, w
                     chosen.get("extension") or ("m4a" if want == "audio" else "mp4")
                 )
                 resolution = _resolution(chosen.get("quality")) if want == "video" else 0
-                caption = f"{title} · {resolution}p" if resolution else title
-                if await send_media_safely(
-                    message,
-                    want,
-                    str(chosen["download"]),
-                    f"youtube.{extension}",
-                    caption,
-                    cancelled=_dl_stopped(job),
-                    progress=job.track,
-                ):
+                if want == "audio":
+                    artist_guess, title_guess, extra = audio_parts(full_title)
+                    ok = await send_song(
+                        message,
+                        str(chosen["download"]),
+                        artist_guess,
+                        title_guess,
+                        duration=_as_int(details.get("duration"))
+                        or _as_int(info.get("duration")),
+                        filename=f"youtube.{extension}",
+                        job=job,
+                        cancelled=_dl_stopped(job),
+                        progress=job.track,
+                        extra=extra,
+                    )
+                else:
+                    ok = await send_media_safely(
+                        message,
+                        "video",
+                        str(chosen["download"]),
+                        f"youtube.{extension}",
+                        video_caption(details or {"title": full_title}, resolution),
+                        _dl_stopped(job),
+                        job.track,
+                        thumb=video_thumb,
+                    )
+                if ok:
                     return
             problems.append("los enlaces de YOSOYYO no descargaron")
         except DownloadCancelled:
@@ -3819,7 +4829,6 @@ async def youtube_download(update: Update, context: ContextTypes.DEFAULT_TYPE, w
         except CommandError as exc:
             problems.append(str(exc))
         _dl_check(job)
-        video_id = youtube_video_id(link) or youtube_video_id(target)
         if not video_id:
             raise CommandError(problems[-1] if problems else "No pude leer ese enlace.")
         job.stage = "Probando otro proveedor de descarga" + (
@@ -3835,15 +4844,33 @@ async def youtube_download(update: Update, context: ContextTypes.DEFAULT_TYPE, w
             )
         job.stage = "Subiendo el archivo a Telegram"
         job.begin()
-        if await send_media_safely(
-            message,
-            want,
-            media["url"],
-            f"youtube.{fmt}",
-            f"{icon} {media['title']}",
-            cancelled=_dl_stopped(job),
-            progress=job.track,
-        ):
+        media_title = str(media.get("title") or details.get("title") or target)
+        if want == "audio":
+            artist_guess, title_guess, extra = audio_parts(media_title)
+            ok = await send_song(
+                message,
+                media["url"],
+                artist_guess,
+                title_guess,
+                duration=_as_int(media.get("duration")) or _as_int(details.get("duration")),
+                filename="youtube.mp3",
+                job=job,
+                cancelled=_dl_stopped(job),
+                progress=job.track,
+                extra=extra,
+            )
+        else:
+            ok = await send_media_safely(
+                message,
+                "video",
+                media["url"],
+                "youtube.mp4",
+                video_caption(details or {"title": media_title}),
+                _dl_stopped(job),
+                job.track,
+                thumb=video_thumb,
+            )
+        if ok:
             return
         raise CommandError(
             "No pude subir el archivo, pero este enlace directo sí funciona "
@@ -3992,9 +5019,13 @@ async def cmd_spotifydl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
     title = str(result.get("title") or "Spotify")
     author = str(result.get("author") or "")
-    caption = f"🎵 {title}" + (f" — {author}" if author else "")
-    ok = await send_media_safely(
-        update.effective_message, "audio", str(download), "spotify.mp3", caption
+    ok = await send_song(
+        update.effective_message,
+        str(download),
+        author,
+        title,
+        filename="spotify.mp3",
+        extra="🟢 Spotify",
     )
     if not ok:
         raise CommandError(f"No pude enviar el audio. Enlace directo:\n{download}")
@@ -4966,16 +5997,27 @@ async def on_download_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     message = update.effective_message
     try:
         async with download_task(update, "MP3 · audio de /ytmusic") as job:
+            job.stage = "Leyendo la ficha del vídeo"
+            details: dict = {}
+            try:
+                details = await youtube_details(video_id)
+            except CommandError:
+                details = {}
+            artist_guess, title_guess = split_song_title(
+                str(details.get("title") or "")
+            )
             job.stage = "Pidiendo el audio a TubeAPI"
             media = await tubeapi_media(video_id, "mp3", cancelled=_dl_stopped(job))
             job.stage = "Subiendo el audio a Telegram"
             job.begin()
-            if not await send_media_safely(
+            if not await send_song(
                 message,
-                "audio",
                 media["url"],
-                "youtube.mp3",
-                f"🎵 {media['title']}",
+                artist_guess,
+                title_guess or str(media.get("title") or ""),
+                duration=_as_int(media.get("duration")) or _as_int(details.get("duration")),
+                filename="youtube.mp3",
+                job=job,
                 cancelled=_dl_stopped(job),
                 progress=job.track,
             ):
