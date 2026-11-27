@@ -76,7 +76,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.26"
+VERSION = "3.27"
 START_TIME = time.time()
 LAST_UPDATE_CHECK = START_TIME
 
@@ -215,6 +215,7 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("pinterest", " <búsqueda>", "imágenes de Pinterest"),
     ("instagram", " <enlace>", "descarga foto o vídeo de Instagram"),
     ("facebook", " <enlace>", "descarga un vídeo de Facebook"),
+    ("tiktok", " <enlace|búsqueda>", "descarga o busca vídeos de TikTok"),
     ("fbstalk", " <enlace>", "info de un vídeo o perfil de Facebook"),
     ("mediafire", " <enlace>", "datos y enlace de MediaFire"),
     ("tourl", " <url>", "sube un archivo y devuelve enlaces"),
@@ -570,7 +571,7 @@ CATEGORIES: list[tuple[str, str, str, str, tuple[str, ...]]] = [
         "Descargas y redes",
         "Descargas y redes sociales",
                 ("mp3", "mp4", "ytmusic", "yt", "spotify", "spotifydl", "pinterest",
-            "instagram", "facebook", "fbstalk", "mediafire", "tourl", "captura",
+            "instagram", "facebook", "tiktok", "fbstalk", "mediafire", "tourl", "captura",
         ),
     ),
     (
@@ -5005,6 +5006,273 @@ async def cmd_facebook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         raise CommandError(f"No pude enviar el vídeo. Enlace directo:\n{video}")
 
 
+# --------------------------------------------------------------------------
+# TikTok: descargar sin marca de agua o buscar vídeos (tikwm.com)
+# Adaptado del comando de Gawr Gura Bot (Node/WhatsApp) a python-telegram-bot.
+# --------------------------------------------------------------------------
+TIKTOK_API = "https://www.tikwm.com/api"
+TIKTOK_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "es-419,es;q=0.9",
+    "Referer": "https://www.tikwm.com/",
+}
+TIKTOK_GAP = 1.25  # su API aguanta más o menos una petición cada 1,25 s
+TIKTOK_CACHE_SECONDS = 180
+TIKTOK_SEARCH_COUNT = 20
+TIKTOK_SEND_RESULTS = 3  # cuántos vídeos de la búsqueda mando
+TIKTOK_URL = re.compile(
+    r"^(?:https?://)?(?:www\.|vm\.|vt\.|m\.)?(?:tiktok\.com|douyin\.com)/", re.I
+)
+
+_TIKTOK_LOCK = asyncio.Lock()
+_TIKTOK_LAST_CALL = 0.0
+_TIKTOK_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _tiktok_cache_get(key: str) -> dict | None:
+    hit = _TIKTOK_CACHE.get(key)
+    if not hit:
+        return None
+    stamp, value = hit
+    if time.time() - stamp > TIKTOK_CACHE_SECONDS:
+        _TIKTOK_CACHE.pop(key, None)
+        return None
+    return value
+
+
+def _tiktok_cache_put(key: str, value: dict) -> None:
+    _TIKTOK_CACHE[key] = (time.time(), value)
+    while len(_TIKTOK_CACHE) > 50:
+        _TIKTOK_CACHE.pop(next(iter(_TIKTOK_CACHE)))
+
+
+def _tiktok_clean(item: dict) -> dict:
+    """Deja la respuesta de tikwm en algo cómodo de usar."""
+    author = item.get("author") if isinstance(item.get("author"), dict) else {}
+    music = item.get("music_info") if isinstance(item.get("music_info"), dict) else {}
+    images = item.get("images") if isinstance(item.get("images"), list) else []
+    video_id = str(item.get("id") or item.get("video_id") or "")
+    unique = str(author.get("unique_id") or "")
+    link = (
+        f"https://www.tiktok.com/@{unique}/video/{video_id}"
+        if unique and video_id
+        else ""
+    )
+    return {
+        "id": video_id,
+        "title": re.sub(r"\s+", " ", str(item.get("title") or "")).strip(),
+        "duration": _as_int(item.get("duration")),
+        "video": str(item.get("play") or item.get("video") or ""),
+        "images": [str(image) for image in images if image],
+        "audio": str(item.get("music") or music.get("play") or ""),
+        "cover": str(item.get("cover") or ""),
+        "plays": _as_int(item.get("play_count")),
+        "url": link,
+        "author": str(author.get("nickname") or ""),
+        "unique": unique,
+    }
+
+
+def _tiktok_get(url: str, xhr: bool = False) -> dict:
+    """GET a tikwm que devuelve el JSON ya comprobado (lanza CommandError)."""
+    headers = dict(TIKTOK_HEADERS)
+    if xhr:
+        headers["X-Requested-With"] = "XMLHttpRequest"
+    status, body, _ = _fetch_url(
+        url, "application/json, text/plain, */*", 30, extra_headers=headers
+    )
+    if status != 200:
+        raise CommandError(f"TikTok respondió HTTP {status}.")
+    try:
+        data = json.loads(body.decode("utf-8", "replace"))
+    except ValueError:
+        raise CommandError("TikTok devolvió una respuesta que no entiendo.")
+    if not isinstance(data, dict):
+        raise CommandError("TikTok devolvió una respuesta que no entiendo.")
+    if data.get("code") != 0:
+        raise CommandError(str(data.get("msg") or "TikTok no aceptó esa petición."))
+    return data
+
+
+def _tiktok_is_limit(error: object) -> bool:
+    return bool(re.search(r"api limit|rate limit|too many", str(error), re.I))
+
+
+async def _tiktok_wait() -> None:
+    """Respeta el hueco entre peticiones que pide la API de tikwm."""
+    global _TIKTOK_LAST_CALL
+    async with _TIKTOK_LOCK:
+        wait = _TIKTOK_LAST_CALL + TIKTOK_GAP - time.time()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _TIKTOK_LAST_CALL = time.time()
+
+
+async def _tiktok_call(url: str, xhr: bool = False) -> dict:
+    """Una llamada con su ritmo, su reintento si hay límite y su salud apuntada."""
+    check_provider("tiktok")
+    data: dict = {}
+    for attempt in range(2):
+        await _tiktok_wait()
+        try:
+            data = await asyncio.to_thread(_tiktok_get, url, xhr)
+            break
+        except CommandError as exc:
+            if attempt == 0 and _tiktok_is_limit(exc):
+                await asyncio.sleep(TIKTOK_GAP + 0.25)
+                continue
+            provider_fail("tiktok", "TikTok", exc)
+            raise
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+            provider_fail("tiktok", "TikTok", exc)
+            raise CommandError(f"No pude contactar con TikTok: {exc}")
+    provider_ok("tiktok", "TikTok")
+    return data
+
+
+async def tiktok_video(link: str) -> dict:
+    """Ficha del vídeo (sin marca de agua) a partir de su enlace."""
+    link = link.strip()
+    key = f"v|{link}"
+    cached = _tiktok_cache_get(key)
+    if cached is not None:
+        return cached
+    if not re.match(r"^https?://", link, re.I):
+        link = "https://" + link.lstrip("/")
+    data = await _tiktok_call(_build_url(f"{TIKTOK_API}/", {"url": link, "hd": "1"}))
+    item = data.get("data")
+    if not isinstance(item, dict) or not item:
+        raise CommandError("Ese vídeo no existe, es privado o lo borraron.")
+    if item.get("status") == "pending" or str(item.get("video_id") or "") == "0":
+        raise CommandError("El vídeo aún se está procesando; inténtalo otra vez.")
+    clean = _tiktok_clean(item)
+    _tiktok_cache_put(key, clean)
+    return clean
+
+
+async def tiktok_search(keywords: str) -> list[dict]:
+    """Busca vídeos en TikTok y devuelve las fichas ya limpias."""
+    count = max(1, min(50, TIKTOK_SEARCH_COUNT))
+    key = f"s|{keywords.strip().lower()}|{count}"
+    cached = _tiktok_cache_get(key)
+    if cached is not None:
+        return cached.get("videos") or []
+    data = await _tiktok_call(
+        _build_url(
+            f"{TIKTOK_API}/feed/search/",
+            {
+                "keywords": keywords.strip(),
+                "count": str(count),
+                "cursor": "0",
+                "web": "1",
+                "hd": "1",
+            },
+        ),
+        xhr=True,
+    )
+    payload = data.get("data") if isinstance(data.get("data"), dict) else {}
+    videos = [
+        _tiktok_clean(video)
+        for video in payload.get("videos") or []
+        if isinstance(video, dict)
+    ]
+    videos = [v for v in videos if v["video"] or v["url"] or v["images"]]
+    _tiktok_cache_put(key, {"videos": videos})
+    return videos
+
+
+def tiktok_caption(item: dict) -> str:
+    lines = [f"🎬 {item['title'] or 'Vídeo de TikTok'}"]
+    who = item["author"] or item["unique"]
+    if item["unique"]:
+        who = (
+            f"{who} (@{item['unique']})"
+            if who and who != item["unique"]
+            else f"@{item['unique']}"
+        )
+    if who:
+        lines.append(f"👤 {who}")
+    bits = []
+    if item["duration"]:
+        bits.append(pretty_duration(item["duration"]))
+    if item["plays"]:
+        bits.append(f"{item['plays']:,} reproducciones".replace(",", "."))
+    if bits:
+        lines.append("📊 " + " · ".join(bits))
+    return truncate("\n".join(lines), 1000)
+
+
+async def tiktok_send(message, item: dict, job: "DownloadJob") -> bool:
+    """Manda el vídeo o el carrusel de fotos de un resultado de TikTok."""
+    caption = tiktok_caption(item)
+    if item["images"]:
+        sent = 0
+        for photo in item["images"][:10]:
+            try:
+                await message.reply_photo(
+                    photo=photo, caption=caption if not sent else None
+                )
+                sent += 1
+            except TelegramError:
+                continue
+        return sent > 0
+    if not re.match(r"^https?://", item["video"] or "", re.I):
+        return False
+    filename = f"tiktok_{item['id'] or uuid.uuid4().hex[:8]}.mp4"
+    return await send_media_safely(
+        message,
+        "video",
+        item["video"],
+        filename,
+        caption,
+        _dl_stopped(job),
+        job.track,
+    )
+
+
+async def cmd_tiktok(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    raw = require_args(
+        context,
+        "/tiktok <enlace o búsqueda>   ej. /tiktok https://vm.tiktok.com/xxxx "
+        "o /tiktok gatos graciosos",
+    )
+    message = update.effective_message
+    if TIKTOK_URL.match(raw.strip()):
+        async with download_task(update, "TikTok · vídeo") as job:
+            item = await tiktok_video(raw)
+            _dl_check(job)
+            job.stage = "Descargando y subiendo el vídeo"
+            if not await tiktok_send(message, item, job):
+                if not item["video"]:
+                    raise CommandError("No encontré el vídeo en ese enlace de TikTok.")
+                raise CommandError(
+                    "No pude subir el vídeo, pero este enlace directo sí funciona:\n"
+                    + item["video"]
+                )
+        return
+    async with download_task(update, f"TikTok · {raw[:60]}") as job:
+        videos = await tiktok_search(raw)
+        if not videos:
+            raise CommandError(f"No encontré vídeos de «{raw}» en TikTok.")
+        sent = 0
+        for item in videos[:TIKTOK_SEND_RESULTS]:
+            _dl_check(job)
+            if not re.match(r"^https?://", item["video"] or "", re.I) and item["url"]:
+                try:
+                    item = await tiktok_video(item["url"])
+                except CommandError:
+                    continue
+            job.begin()
+            job.stage = "Descargando y subiendo el vídeo"
+            if await tiktok_send(message, item, job):
+                sent += 1
+        if not sent:
+            raise CommandError(
+                f"Encontré {len(videos)} vídeos de «{raw}», pero no pude bajar ninguno."
+            )
+
+
 async def cmd_fbstalk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     link = require_args(context, "/fbstalk <enlace de vídeo o perfil>")
     result = await yoyo_json("/api/fbstalk", {"url": link})
@@ -6293,6 +6561,7 @@ HANDLERS = {
     "pinterest": cmd_pinterest,
     "instagram": cmd_instagram,
     "facebook": cmd_facebook,
+    "tiktok": cmd_tiktok,
     "fbstalk": cmd_fbstalk,
     "mediafire": cmd_mediafire,
     "tourl": cmd_tourl,
