@@ -72,13 +72,15 @@ from telegram.ext import (
     InlineQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.30"
+VERSION = "3.31"
 START_TIME = time.time()
 LAST_UPDATE_CHECK = START_TIME
 
@@ -232,6 +234,11 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("cumple", " <nombre> <edad> <fecha>", "tarjeta de cumpleaños"),
     ("nivel", " <nombre> <nivel> <xp> <máx>", "tarjeta de nivel"),
     ("apistatus", "", "consumo de la API de YOSOYYO"),
+    (
+        "antilink",
+        " [on|off|acción eliminar|advertir|kick|perdonar]",
+        "frena los enlaces del grupo (borrar, avisar o expulsar)",
+    ),
     ("echo", " <texto>", "repito tu texto"),
 ]
 
@@ -390,7 +397,7 @@ DATA_FILE = SELF_PATH.with_name("bot_data.json")
 # Tu ID de Telegram para recibir avisos cuando una API falle (míralo en /info).
 OWNER_ID: int | None = None
 
-_DATA: dict = {"reminders": [], "usage": {}, "prefs": {}}
+_DATA: dict = {"reminders": [], "usage": {}, "prefs": {}, "antilink": {}}
 _DATA_DIRTY = False
 
 
@@ -401,7 +408,7 @@ def load_data() -> None:
         return
     if not isinstance(parsed, dict):
         return
-    for key in ("reminders", "usage", "prefs"):
+    for key in ("reminders", "usage", "prefs", "antilink"):
         if isinstance(parsed.get(key), type(_DATA[key])):
             _DATA[key] = parsed[key]
 
@@ -632,6 +639,13 @@ CATEGORIES: list[tuple[str, str, str, str, tuple[str, ...]]] = [
         "IA y herramientas",
         "IA y herramientas",
         ("ia", "deepai", "calc", "claves", "apistatus", "publicar", "resumen"),
+    ),
+    (
+        "moderacion",
+        "🛡",
+        "Moderación",
+        "Moderación de grupos",
+        ("antilink",),
     ),
     (
         "bot",
@@ -6639,6 +6653,405 @@ async def register_commands(application: Application) -> None:
         print(f"No se pudieron registrar los comandos en el menú: {exc}")
 
 
+# --------------------------------------------------------------------------
+# Antilink: moderación de enlaces en los grupos
+# --------------------------------------------------------------------------
+ANTILINK_WARN_LIMIT = 3
+ANTILINK_ACTIONS = {
+    "delete": "🗑 Solo borrar",
+    "warn": "⚠️ Advertir",
+    "kick": "👢 Expulsar",
+}
+ANTILINK_ALIASES = {
+    "delete": "delete",
+    "borrar": "delete",
+    "eliminar": "delete",
+    "del": "delete",
+    "borra": "delete",
+    "warn": "warn",
+    "advertir": "warn",
+    "aviso": "warn",
+    "avisar": "warn",
+    "warning": "warn",
+    "kick": "kick",
+    "expulsar": "kick",
+    "patada": "kick",
+    "ban": "kick",
+    "banear": "kick",
+}
+# Extensiones de archivo que no deben confundirse con dominios (bot.py, foto.jpg…)
+ANTILINK_FILE_SUFFIXES = {
+    "py", "js", "ts", "json", "txt", "md", "png", "jpg", "jpeg", "gif",
+    "webp", "mp3", "mp4", "pdf", "zip", "rar", "exe", "apk", "csv", "html", "css",
+}
+ANTILINK_RE = re.compile(
+    r"(?:https?://|www\.|t\.me/|telegram\.me/|tg://)"
+    r"|\b[\w-]+(?:\.[\w-]+)*\.([a-z]{2,24})\b",
+    re.IGNORECASE,
+)
+
+_ADMIN_CACHE: dict[tuple[str, int], tuple[float, bool]] = {}
+_ADMIN_CACHE_SECONDS = 180
+_KEEP_ALIVE: set = set()
+_ANTILINK_NOTICED: set[str] = set()
+
+
+def looks_like_link(text: str, entities=()) -> bool:
+    """True si el texto (o sus entidades) trae un enlace."""
+    for entity in entities or ():
+        if getattr(entity, "type", "") in ("url", "text_link"):
+            return True
+    for match in ANTILINK_RE.finditer(text or ""):
+        suffix = match.group(1)
+        if suffix is None or suffix.lower() not in ANTILINK_FILE_SUFFIXES:
+            return True
+    return False
+
+
+def antilink_config(chat_id: object) -> dict:
+    """Configuración del antilink de un grupo (la crea si no existe)."""
+    config = _DATA["antilink"].get(str(chat_id))
+    if not isinstance(config, dict):
+        config = {}
+        _DATA["antilink"][str(chat_id)] = config
+    config.setdefault("on", False)
+    config.setdefault("action", "warn")
+    config.setdefault("warns", {})
+    return config
+
+
+def antilink_saved() -> None:
+    global _DATA_DIRTY
+    _DATA_DIRTY = True
+    save_data()
+
+
+def delete_later(message, seconds: float) -> None:
+    """Borra un mensaje del bot un rato después, sin bloquear el handler."""
+    async def worker() -> None:
+        await asyncio.sleep(seconds)
+        try:
+            await message.delete()
+        except TelegramError:
+            pass
+
+    task = asyncio.create_task(worker())
+    _KEEP_ALIVE.add(task)
+    task.add_done_callback(_KEEP_ALIVE.discard)
+
+
+async def is_chat_admin(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: object, user_id: int, fresh: bool = False
+) -> bool:
+    """Mira si un usuario es administrador del grupo (con caché corta)."""
+    key = (str(chat_id), int(user_id))
+    now = time.time()
+    cached = _ADMIN_CACHE.get(key)
+    if cached and not fresh and cached[0] > now:
+        return cached[1]
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+    except TelegramError:
+        return False
+    is_admin = member.status in ("administrator", "creator", "owner")
+    _ADMIN_CACHE[key] = (now + _ADMIN_CACHE_SECONDS, is_admin)
+    return is_admin
+
+
+def antilink_text(chat_title: str, config: dict) -> str:
+    action = config.get("action", "warn")
+    total_warns = sum(int(value) for value in (config.get("warns") or {}).values())
+    lines = [
+        "🛡 ANTILINK",
+        f"Grupo: {chat_title}",
+        f"Estado: {'✅ activado' if config.get('on') else '⛔️ desactivado'}",
+        f"Acción: {ANTILINK_ACTIONS.get(action, action)}",
+        f"Avisos puestos: {total_warns}",
+        "",
+        "Qué hace con cada enlace:",
+        "🗑 Solo borrar — elimina el mensaje y ya.",
+        "⚠️ Advertir — borra y avisa; al aviso "
+        f"{ANTILINK_WARN_LIMIT} expulsa del grupo.",
+        "👢 Expulsar — borra el mensaje y saca al usuario del grupo.",
+        "",
+        "Los administradores nunca se ven afectados.",
+        "Uso: /antilink on · /antilink off · /antilink accion advertir",
+        "Para quitar avisos: /antilink perdonar (respondiendo a la persona) o /antilink perdonar @usuario.",
+        "Necesito ser administrador con permiso para borrar mensajes y banear.",
+    ]
+    return truncate("\n".join(lines))
+
+
+def antilink_keyboard(config: dict) -> InlineKeyboardMarkup:
+    action = config.get("action", "warn")
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton("🟢 Activar" if not config.get("on") else "🟢 Activado", callback_data="al:on"),
+            InlineKeyboardButton("🔴 Desactivar", callback_data="al:off"),
+        ]
+    ]
+    row: list[InlineKeyboardButton] = []
+    for key, label in ANTILINK_ACTIONS.items():
+        mark = "✅ " if key == action else ""
+        row.append(InlineKeyboardButton(f"{mark}{label}", callback_data=f"al:a:{key}"))
+    rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+async def cmd_antilink(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Configura el antilink del grupo (solo administradores)."""
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if message is None or chat is None or user is None:
+        return
+    if chat.type not in ("group", "supergroup"):
+        raise CommandError("El antilink solo funciona dentro de un grupo.")
+    if not await is_chat_admin(context, chat.id, user.id, fresh=True):
+        raise CommandError("Solo un administrador del grupo puede configurar el antilink.")
+
+    config = antilink_config(chat.id)
+    args = [part for part in (context.args or []) if part.strip()]
+    sub = fold(args[0]) if args else ""
+    title = chat.title or "este grupo"
+
+    if sub in ("on", "activar", "encender", "si"):
+        config["on"] = True
+        antilink_saved()
+        await message.reply_text(
+            "🛡 Antilink ACTIVADO.\n"
+            f"Acción actual: {ANTILINK_ACTIONS.get(config.get('action'), config.get('action'))}.\n"
+            "Cualquier enlace de alguien que no sea administrador se frena.",
+            reply_markup=antilink_keyboard(config),
+        )
+        return
+
+    if sub in ("off", "desactivar", "apagar", "no"):
+        config["on"] = False
+        antilink_saved()
+        await message.reply_text(
+            "⛔️ Antilink desactivado. Los enlaces vuelven a pasar sin problema.",
+            reply_markup=antilink_keyboard(config),
+        )
+        return
+
+    if sub in ("accion", "modo", "opcion"):
+        if len(args) < 2:
+            raise CommandError("Uso: /antilink accion eliminar | advertir | kick")
+        alias = fold(args[1])
+        action = ANTILINK_ALIASES.get(alias)
+        if action is None:
+            raise CommandError(
+                "Esa acción no existe. Elige eliminar (solo borrar), advertir o kick (expulsar)."
+            )
+        config["action"] = action
+        config["on"] = True
+        antilink_saved()
+        await message.reply_text(
+            f"✅ Antilink activo con la acción: {ANTILINK_ACTIONS[action]}.",
+            reply_markup=antilink_keyboard(config),
+        )
+        return
+
+    if sub in ("perdonar", "perdon", "reset"):
+        await antilink_forgive(update, context, chat, config, args[1:])
+        return
+
+    if sub and sub not in ("estado", "panel", "ver") and sub in ANTILINK_ALIASES:
+        config["action"] = ANTILINK_ALIASES[sub]
+        config["on"] = True
+        antilink_saved()
+        await message.reply_text(
+            f"✅ Antilink activo con la acción: {ANTILINK_ACTIONS[config['action']]}.",
+            reply_markup=antilink_keyboard(config),
+        )
+        return
+
+    if sub and sub not in ("estado", "panel", "ver"):
+        raise CommandError(
+            "Uso: /antilink [on|off] · /antilink accion eliminar|advertir|kick · "
+            "/antilink perdonar @usuario"
+        )
+
+    await message.reply_text(antilink_text(title, config), reply_markup=antilink_keyboard(config))
+
+
+async def antilink_forgive(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat,
+    config: dict,
+    args: list[str],
+) -> None:
+    """Quita los avisos de antilink a una persona."""
+    message = update.effective_message
+    target = None
+    replied = message.reply_to_message if message is not None else None
+    if replied is not None and replied.from_user is not None:
+        target = replied.from_user
+    elif args:
+        who = args[0].lstrip("@")
+        try:
+            member = await context.bot.get_chat_member(
+                chat.id, int(who) if who.isdigit() else f"@{who}"
+            )
+            target = member.user
+        except (TelegramError, ValueError):
+            raise CommandError(
+                "No encontré a esa persona en el grupo. Responde a un mensaje suyo o pasa su @usuario."
+            )
+    if target is None:
+        raise CommandError("Responde a un mensaje de esa persona o escribe /antilink perdonar @usuario.")
+    warns = config.setdefault("warns", {})
+    if warns.pop(str(target.id), None) is None:
+        await message.reply_text(f"ℹ️ {target.first_name or 'Ese usuario'} no tiene avisos de antilink.")
+        return
+    antilink_saved()
+    await message.reply_text(
+        f"✅ Avisos de antilink borrados para {target.first_name or 'ese usuario'}."
+    )
+
+
+async def antilink_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Borra, avisa o expulsa cuando alguien manda un enlace al grupo."""
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if message is None or chat is None or user is None:
+        return
+    if chat.type not in ("group", "supergroup") or user.is_bot:
+        return
+    if getattr(message, "sender_chat", None) is not None:
+        return
+    stored = _DATA["antilink"].get(str(chat.id))
+    if not isinstance(stored, dict) or not stored.get("on"):
+        return
+    entities = list(message.entities or []) + list(message.caption_entities or [])
+    if not looks_like_link(message.text or message.caption or "", entities):
+        return
+    if await is_chat_admin(context, chat.id, user.id):
+        return
+
+    config = antilink_config(chat.id)
+    try:
+        await message.delete()
+    except TelegramError as exc:
+        print(f"Antilink: no pude borrar un mensaje en {chat.id}: {exc}")
+        if str(chat.id) not in _ANTILINK_NOTICED:
+            _ANTILINK_NOTICED.add(str(chat.id))
+            try:
+                note = await context.bot.send_message(
+                    chat.id,
+                    "⚠️ El antilink está activo pero no puedo borrar mensajes. "
+                    "Hazme administrador con permiso para borrar y banear.",
+                )
+                delete_later(note, 30)
+            except TelegramError:
+                pass
+        return
+
+    name = user.first_name or "usuario"
+    action = config.get("action", "warn")
+
+    if action == "delete":
+        return
+
+    if action == "warn":
+        warns = config.setdefault("warns", {})
+        count = int(warns.get(str(user.id), 0)) + 1
+        if count >= ANTILINK_WARN_LIMIT:
+            await antilink_kick(context, chat, user, config)
+            return
+        warns[str(user.id)] = count
+        antilink_saved()
+        try:
+            note = await context.bot.send_message(
+                chat.id,
+                f"⚠️ {name}, los enlaces no están permitidos aquí.\n"
+                f"Aviso {count}/{ANTILINK_WARN_LIMIT}: al siguiente te saco del grupo.",
+            )
+            delete_later(note, 20)
+        except TelegramError as exc:
+            print(f"Antilink: no pude avisar en {chat.id}: {exc}")
+        return
+
+    await antilink_kick(context, chat, user, config)
+
+
+async def antilink_kick(context: ContextTypes.DEFAULT_TYPE, chat, user, config: dict) -> None:
+    """Expulsa a alguien del grupo (y borra sus avisos)."""
+    config.setdefault("warns", {}).pop(str(user.id), None)
+    antilink_saved()
+    name = user.first_name or "Usuario"
+    try:
+        await context.bot.ban_chat_member(chat.id, user.id, revoke_messages=False)
+        # Se levanta el veto enseguida: así puede volver si lo invitan.
+        await context.bot.unban_chat_member(chat.id, user.id, only_if_banned=True)
+    except TelegramError as exc:
+        print(f"Antilink: no pude expulsar a {user.id} de {chat.id}: {exc}")
+        try:
+            note = await context.bot.send_message(
+                chat.id,
+                "⚠️ No pude expulsar a esa persona. Revisa que yo sea administrador "
+                "con permiso para banear.",
+            )
+            delete_later(note, 30)
+        except TelegramError:
+            pass
+        return
+    try:
+        note = await context.bot.send_message(
+            chat.id, f"👢 {name} fuera del grupo: los enlaces no están permitidos."
+        )
+        delete_later(note, 30)
+    except TelegramError as exc:
+        print(f"Antilink: no pude avisar de la expulsión en {chat.id}: {exc}")
+
+
+async def on_antilink_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Botones del panel de /antilink."""
+    query = update.callback_query
+    if query is None:
+        return
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat is None or user is None:
+        await query.answer()
+        return
+    if chat.type not in ("group", "supergroup"):
+        await query.answer("Esto solo funciona en grupos.", show_alert=True)
+        return
+    if not await is_chat_admin(context, chat.id, user.id, fresh=True):
+        await query.answer("Solo un administrador puede cambiar el antilink.", show_alert=True)
+        return
+
+    config = antilink_config(chat.id)
+    data = query.data or ""
+    if data == "al:on":
+        config["on"] = True
+    elif data == "al:off":
+        config["on"] = False
+    elif data.startswith("al:a:"):
+        action = data[len("al:a:") :]
+        if action not in ANTILINK_ACTIONS:
+            await query.answer("Esa opción no existe.", show_alert=True)
+            return
+        config["action"] = action
+        config["on"] = True
+    else:
+        await query.answer()
+        return
+
+    antilink_saved()
+    await query.answer("Guardado ✅")
+    try:
+        await query.edit_message_text(
+            antilink_text(chat.title or "este grupo", config), reply_markup=antilink_keyboard(config)
+        )
+    except TelegramError as exc:
+        print(f"Antilink: no pude editar el panel en {chat.id}: {exc}")
+
+
 HANDLERS = {
     "start": cmd_start,
     "menu": cmd_menu,
@@ -6738,6 +7151,7 @@ HANDLERS = {
     "cumple": cmd_cumple,
     "nivel": cmd_nivel,
     "apistatus": cmd_apistatus,
+    "antilink": cmd_antilink,
     "echo": cmd_echo,
 }
 
@@ -6785,6 +7199,15 @@ def _counted(command: str, handler):
 def register_handlers(application: Application) -> None:
     for command, handler in HANDLERS.items():
         application.add_handler(CommandHandler(command, _counted(command, handler)))
+    # El antilink va en el grupo -1 para revisar los mensajes antes que nadie.
+    application.add_handler(
+        MessageHandler(
+            filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
+            antilink_guard,
+        ),
+        group=-1,
+    )
+    application.add_handler(CallbackQueryHandler(on_antilink_callback, pattern=r"^al:"))
     application.add_handler(CallbackQueryHandler(on_menu_callback, pattern=r"^m:"))
     application.add_handler(CallbackQueryHandler(on_update_callback, pattern=r"^upd:"))
     application.add_handler(CallbackQueryHandler(on_reminder_callback, pattern=r"^rm:"))
