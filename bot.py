@@ -29,6 +29,7 @@ import ast
 import asyncio
 import base64
 import hashlib
+import hmac
 import html
 import io
 import json
@@ -47,7 +48,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, unquote_plus, urlencode
+from urllib.parse import parse_qs, quote, unquote, unquote_plus, urlencode, urlsplit
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
@@ -63,6 +64,7 @@ from telegram import (
     InputMediaPhoto,
     InputMediaVideo,
     InputTextMessageContent,
+    LinkPreviewOptions,
     Update,
 )
 from telegram.error import InvalidToken, NetworkError, RetryAfter, TelegramError
@@ -80,7 +82,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.31"
+VERSION = "3.32"
 START_TIME = time.time()
 LAST_UPDATE_CHECK = START_TIME
 
@@ -222,9 +224,12 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("tiktok", " <enlace|búsqueda>", "descarga o busca vídeos de TikTok"),
     ("fbstalk", " <enlace>", "info de un vídeo o perfil de Facebook"),
     ("mediafire", " <enlace>", "descarga un archivo de MediaFire"),
+    ("terabox", " <enlace> [número]", "descarga un archivo de TeraBox"),
+    ("oploverz", " <anime>", "busca un anime en Oploverz con sus enlaces"),
     ("tourl", " <url>", "sube un archivo y devuelve enlaces"),
     ("captura", " <url>", "captura de pantalla de una web"),
     ("ia", " <pregunta>", "pregúntale a la IA DeepSeek"),
+    ("humanizar", " [estilo] <texto>", "reescribe un texto para que suene humano"),
     ("deepai", " <pregunta>", "chatea con la IA de DeepAI"),
     ("tts", " <texto>", "convierte un texto en voz"),
     ("brat", " <texto>", "imagen con el estilo brat"),
@@ -242,9 +247,11 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("echo", " <texto>", "repito tu texto"),
 ]
 
+# Telegram solo acepta 100 comandos en el menú nativo. Los que quedan fuera de
+# esa lista siguen funcionando igual y aparecen en /menu y en /help.
+NATIVE_MENU_LIMIT = 100
+NATIVE_MENU_SKIP = {"echo", "aburrido", "consejo"}
 
-# --------------------------------------------------------------------------
-# Token: leer, pedir y guardar
 # --------------------------------------------------------------------------
 def read_saved_token() -> str | None:
     """Devuelve el token guardado, o None si no existe o está vacío."""
@@ -580,7 +587,8 @@ CATEGORIES: list[tuple[str, str, str, str, tuple[str, ...]]] = [
         "Descargas y redes",
         "Descargas y redes sociales",
                 ("mp3", "mp4", "ytmusic", "yt", "spotify", "spotifydl", "pinterest",
-            "instagram", "facebook", "tiktok", "fbstalk", "mediafire", "tourl", "captura",
+            "instagram", "facebook", "tiktok", "fbstalk", "mediafire", "terabox",
+            "oploverz", "tourl", "captura",
         ),
     ),
     (
@@ -638,7 +646,7 @@ CATEGORIES: list[tuple[str, str, str, str, tuple[str, ...]]] = [
         "🤖",
         "IA y herramientas",
         "IA y herramientas",
-        ("ia", "deepai", "calc", "claves", "apistatus", "publicar", "resumen"),
+        ("ia", "deepai", "humanizar", "calc", "claves", "apistatus", "publicar", "resumen"),
     ),
     (
         "moderacion",
@@ -6645,8 +6653,13 @@ async def on_startup(application: Application) -> None:
 async def register_commands(application: Application) -> None:
     """Publica el menú de comandos en Telegram (se ejecuta al arrancar)."""
     try:
+        # Telegram corta en 100 comandos: mando los primeros y el resto vive en /menu.
+        listed = [item for item in COMMANDS if item[0] not in NATIVE_MENU_SKIP]
         await application.bot.set_my_commands(
-            [BotCommand(command, description) for command, _, description in COMMANDS]
+            [
+                BotCommand(command, description)
+                for command, _, description in listed[:NATIVE_MENU_LIMIT]
+            ]
         )
         print("Comandos registrados en el menú de Telegram.")
     except TelegramError as exc:
@@ -7052,6 +7065,764 @@ async def on_antilink_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         print(f"Antilink: no pude editar el panel en {chat.id}: {exc}")
 
 
+# --------------------------------------------------------------------------
+# HumanizeAI: reescribe un texto para que no parezca escrito por una IA
+# --------------------------------------------------------------------------
+HUMANIZE_ENDPOINT = "https://www.humanizeai.pro/api/process"
+HUMANIZE_MAX_CHARS = 4000
+HUMANIZE_TONES = {
+    "estandar": "standard",
+    "estándar": "standard",
+    "simple": "simple",
+    "fluido": "flowing",
+    "informal": "informal",
+    "formal": "formal",
+    "academico": "academic",
+    "académico": "academic",
+    "expandir": "expand",
+    "acortar": "shorten",
+    "libre": "free",
+}
+
+
+def _humanize_blocking(text: str, style: str) -> str:
+    """Pide a HumanizeAI que reescriba el texto; devuelve solo el resultado."""
+    payload = {
+        "test_allultra": None,
+        "text": text,
+        "trialNumber": 0,
+        "alg": 0,
+        "sessionId": uuid.uuid4().hex[:26],
+        "keywords": [],
+        "style": style,
+        "isLogged": False,
+        "ultra": False,
+        "mode": "balanced",
+        "isSample": False,
+        "visibleWords": 200,
+    }
+    headers = {
+        "Origin": "https://www.humanizeai.pro",
+        "Referer": "https://www.humanizeai.pro/",
+    }
+    last = ""
+    for attempt in range(3):
+        try:
+            status, body, _ = _fetch_url(
+                HUMANIZE_ENDPOINT,
+                "application/json",
+                60,
+                method="POST",
+                payload=payload,
+                extra_headers=headers,
+            )
+        except (URLError, TimeoutError, OSError) as exc:
+            last = str(exc)
+            time.sleep(1.5 * (attempt + 1))
+            continue
+        if status == 200:
+            try:
+                data = json.loads(body.decode("utf-8", "replace"))
+            except ValueError:
+                raise CommandError("HumanizeAI devolvió algo que no es JSON.")
+            results = data.get("result") if isinstance(data, dict) else None
+            if isinstance(results, list) and results:
+                last_item = results[-1] if isinstance(results[-1], dict) else {}
+                out = str(last_item.get("text") or "").strip()
+                if out:
+                    return out
+            raise CommandError("HumanizeAI no devolvió ningún texto.")
+        if status == 429 or status >= 500:
+            last = f"HTTP {status}"
+            time.sleep(1.5 * (attempt + 1))
+            continue
+        raise CommandError(f"HumanizeAI rechazó el texto (HTTP {status}).")
+    raise CommandError(f"HumanizeAI no respondió bien ({last or 'sin respuesta'}).")
+
+
+async def cmd_humanizar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    raw = require_args(
+        context,
+        "/humanizar [estilo] <texto>   ej. /humanizar informal Hola, necesito un favor",
+    )
+    parts = raw.split(maxsplit=1)
+    style = "standard"
+    text = raw
+    if len(parts) > 1 and parts[0].lower() in HUMANIZE_TONES:
+        style = HUMANIZE_TONES[parts[0].lower()]
+        text = parts[1]
+    text = text.strip()
+    if not text:
+        raise CommandError("Escríbeme el texto que quieres humanizar.")
+    if len(text) > HUMANIZE_MAX_CHARS:
+        raise CommandError(
+            f"El texto es muy largo ({len(text)} caracteres). "
+            f"Mándame como máximo {HUMANIZE_MAX_CHARS}."
+        )
+    check_provider("humanizeai")
+    try:
+        result = await asyncio.to_thread(_humanize_blocking, text, style)
+    except CommandError as exc:
+        provider_fail("humanizeai", "HumanizeAI", exc)
+        raise
+    provider_ok("humanizeai", "HumanizeAI")
+    await update.effective_message.reply_text(
+        truncate(f"✍️ Texto humanizado:\n\n{result}"),
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+
+
+# --------------------------------------------------------------------------
+# TeraBox: resuelve enlaces de archivo compartido y descarga el archivo
+# --------------------------------------------------------------------------
+TERABOX_HOSTS = (
+    "terabox.com",
+    "terabox.app",
+    "teraboxshare.com",
+    "1024terabox.com",
+    "1024tera.com",
+    "4funbox.com",
+    "mirrobox.com",
+    "nephobox.com",
+    "freeterabox.com",
+    "tibabox.com",
+    "momerybox.com",
+    "teraboxlink.com",
+)
+TERABOX_API_HOSTS = ("https://www.terabox.com", "https://terabox.com")
+TERABOX_HMAC_KEY = "B8ec!4caf34ef7!!7c66767d!9ffd3fb"
+TERABOX_CUID = "1000000000000001"
+TERABOX_MAX_FILES = 300
+TERABOX_LISTED = 15  # cuántos archivos enumero cuando el enlace es una carpeta
+
+
+def _tb_size(value: object) -> str:
+    """Bytes a algo legible (1.4 GB)."""
+    try:
+        size = float(value or 0)
+    except (TypeError, ValueError):
+        return "?"
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{size:.0f} {unit}" if unit in ("B", "KB") else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def terabox_share(link: str) -> dict:
+    """Saca el código (y la contraseña, si la lleva) del enlace de TeraBox."""
+    value = (link or "").strip()
+    if not value:
+        raise CommandError("Mándame un enlace de TeraBox.")
+    if not re.match(r"^https?://", value, re.I):
+        if value.startswith("/"):
+            value = "https://www.terabox.com" + value
+        elif value.startswith("s/"):
+            value = "https://www.terabox.com/" + value
+        else:
+            value = "https://www.terabox.com/s/" + value
+    parsed = urlsplit(value)
+    host = (parsed.netloc or "").lower()
+    if not any(name in host for name in TERABOX_HOSTS):
+        raise CommandError("Ese enlace no parece de TeraBox (terabox.com/s/…).")
+    query = parse_qs(parsed.query)
+    found = re.search(r"/s/([^/?#]+)", parsed.path)
+    code = found.group(1) if found else ""
+    if not code:
+        code = (query.get("surl") or query.get("shorturl") or [""])[0]
+    if not code:
+        raise CommandError("No encontré el código del enlace de TeraBox.")
+    code = unquote(code).strip()
+    if not code:
+        raise CommandError("No encontré el código del enlace de TeraBox.")
+    if not code.startswith("1"):
+        code = "1" + code
+    password = (query.get("pwd") or query.get("password") or [""])[0]
+    return {"code": code, "pwd": unquote(password).strip()}
+
+
+def _tb_extract_json(page: str, marker: str) -> dict | None:
+    """Saca el objeto JSON que va justo después de un marcador del HTML."""
+    position = page.find(marker)
+    if position < 0:
+        return None
+    start = page.find("{", position + len(marker))
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(page)):
+        char = page[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(page[start : index + 1])
+                except ValueError:
+                    return None
+    return None
+
+
+def _tb_js_token(page: str) -> str:
+    """Token anti-bot que la página esconde en un eval(decodeURIComponent(…))."""
+    encoded = re.search(r"eval\(decodeURIComponent\(`([^`]+)`\)\)", page)
+    if encoded:
+        try:
+            decoded = unquote(encoded.group(1))
+        except Exception:
+            decoded = ""
+        token = re.search(r'fn\("([^"]+)"\)', decoded or "")
+        if token:
+            return token.group(1)
+    direct = re.search(r"window\.jsToken\s*=\s*['\"]([^'\"]+)", page)
+    return direct.group(1) if direct else ""
+
+
+def _tb_http(url: str, method: str = "GET", form: dict | None = None, referer: str = "") -> dict:
+    """GET/POST a la API de TeraBox devolviendo el JSON ya parseado."""
+    data = None
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    if form is not None:
+        data = urlencode(form).encode("utf-8")
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    if referer:
+        headers["Referer"] = referer
+    request = Request(url, data=data, method=method, headers=headers)
+    try:
+        with urlopen(request, timeout=40) as response:
+            raw = response.read().decode("utf-8", "replace")
+    except HTTPError as exc:
+        try:
+            raw = exc.read().decode("utf-8", "replace")
+        finally:
+            exc.close()
+    except (URLError, TimeoutError, OSError) as exc:
+        raise CommandError(f"No pude hablar con TeraBox: {exc}")
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        raise CommandError("TeraBox devolvió una página en vez de datos (¿enlace roto?).")
+    if not isinstance(parsed, dict):
+        raise CommandError("TeraBox devolvió una respuesta rara.")
+    return parsed
+
+
+def _tb_error(data: dict, label: str) -> str:
+    """Traduce el errno de TeraBox a algo que se entienda."""
+    code = data.get("errno", data.get("error_code"))
+    message = str(
+        data.get("errmsg") or data.get("show_msg") or data.get("message") or ""
+    ).strip()
+    if code in (-3, 400210):
+        return "Ese enlace de TeraBox caducó o ya no está disponible."
+    if code == -9:
+        return "Ese enlace de TeraBox pide contraseña: pásamela con ?pwd=…"
+    if code in (105, 460030):
+        return "El código de ese enlace de TeraBox no es válido."
+    text = f"TeraBox respondió con un error ({label}"
+    text += f" {code})" if code is not None else ")"
+    return text + (f": {message}" if message else ".")
+
+
+def _tb_url(path: str, params: dict) -> str:
+    clean = {key: value for key, value in params.items() if value not in (None, "")}
+    return f"{TERABOX_API_HOSTS[0]}{path}?{urlencode(clean)}"
+
+
+def _tb_meta(data: dict) -> dict:
+    share_id = data.get("shareid") or data.get("shareId")
+    uk = data.get("uk")
+    if not share_id or not uk:
+        raise CommandError("TeraBox no devolvió el identificador del enlace.")
+    try:
+        kind = int(data.get("type") or 0)
+    except (TypeError, ValueError):
+        kind = 0
+    return {
+        "shareid": str(share_id),
+        "uk": str(uk),
+        "sign": data.get("sign") or "",
+        "timestamp": data.get("timestamp") or 0,
+        "randsk": data.get("randsk") or data.get("sekey") or "",
+        "list": data.get("list") if isinstance(data.get("list"), list) else [],
+        "type": kind,
+    }
+
+
+def _tb_hmac(text: str) -> str:
+    return hmac.new(TERABOX_HMAC_KEY.encode(), text.encode(), hashlib.sha1).hexdigest()
+
+
+def _tb_list(meta: dict, fid: str = "") -> list:
+    """Lista el contenido del enlace (o de una carpeta concreta)."""
+    stamp = int(time.time())
+    params = {
+        "shareid": meta["shareid"],
+        "uk": meta["uk"],
+        "page": "1",
+        "needsublist": "1",
+        "sign": _tb_hmac(f"{meta['shareid']}_{meta['uk']}_{TERABOX_CUID}_{stamp}"),
+        "timestamp": str(stamp),
+        "share_type": str(meta["type"]),
+    }
+    if fid:
+        params["fid"] = str(fid)
+    else:
+        params["root"] = "1"
+    sekey = unquote(meta["randsk"]) if meta["randsk"] else ""
+    if sekey:
+        params["sekey"] = sekey
+    data = _tb_http(_tb_url("/api/list", params))
+    if data.get("errno") != 0:
+        raise CommandError(_tb_error(data, "lista"))
+    return [item for item in (data.get("list") or []) if isinstance(item, dict)]
+
+
+
+def _tb_page(share: dict) -> dict:
+    """Lee la página del enlace: de ahí salen shareid, uk, sign y jsToken."""
+    url = f"https://www.terabox.com/s/{quote(share['code'])}"
+    request = Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Upgrade-Insecure-Requests": "1",
+        },
+    )
+    try:
+        with urlopen(request, timeout=40) as response:
+            page = response.read().decode("utf-8", "replace")
+            final_url = response.geturl() or url
+    except HTTPError as exc:
+        exc.close()
+        raise CommandError(f"TeraBox respondió HTTP {exc.code} en la página del enlace.")
+    except (URLError, TimeoutError, OSError) as exc:
+        raise CommandError(f"No pude abrir el enlace de TeraBox: {exc}")
+    state = _tb_extract_json(page, "window.__INITIAL_STATE__")
+    share_state = ((state or {}).get("pinia") or {}).get("share") or {}
+    info = share_state.get("shareInfo") or {}
+    if not info:
+        raise CommandError("Ese enlace de TeraBox no tiene ningún archivo visible.")
+    if info.get("errno") not in (None, 0):
+        raise CommandError(_tb_error(info, "página"))
+    items = share_state.get("shareFiles") or []
+    if not items and info.get("fileInfo"):
+        items = [info["fileInfo"]]
+    return {
+        "info": info,
+        "items": [item for item in items if isinstance(item, dict)],
+        "jsToken": _tb_js_token(page),
+        "pageUrl": final_url,
+    }
+
+
+def _tb_shorturl(share: dict, js_token: str = "", page_url: str = "") -> dict:
+    """Pide los datos del enlace a la API (con contraseña si hace falta)."""
+    params = {
+        "app_id": "250528",
+        "web": "1",
+        "channel": "dubox",
+        "clienttype": "0",
+        "shorturl": share["code"],
+        "root": "1",
+    }
+    if js_token:
+        params["jsToken"] = js_token
+    data = _tb_http(_tb_url("/api/shorturlinfo", params), referer=page_url)
+    if data.get("errno") == -9 and share["pwd"]:
+        verified = _tb_verify(share, data)
+        if verified:
+            return verified
+    if data.get("errno") != 0:
+        raise CommandError(_tb_error(data, "enlace"))
+    return data
+
+
+def _tb_verify(share: dict, partial: dict) -> dict | None:
+    """Manda la contraseña del enlace y vuelve a pedir los datos."""
+    share_id = partial.get("shareid") or partial.get("shareId")
+    uk = partial.get("uk")
+    if not share_id or not uk:
+        return None
+    answer = _tb_http(
+        _tb_url("/share/verify", {"shareid": share_id, "uk": uk}),
+        method="POST",
+        form={"pwd": share["pwd"], "vcode": "", "vcode_str": ""},
+    )
+    if answer.get("errno") != 0:
+        return None
+    again = _tb_http(
+        _tb_url(
+            "/api/shorturlinfo",
+            {
+                "app_id": "250528",
+                "web": "1",
+                "channel": "dubox",
+                "clienttype": "0",
+                "shareid": share_id,
+                "uk": uk,
+                "spd": share["pwd"],
+                "root": "1",
+                "type": "0",
+            },
+        )
+    )
+    return again if again.get("errno") == 0 else None
+
+
+def _tb_pick_dlink(data: dict) -> str:
+    direct = data.get("dlink")
+    if isinstance(direct, str) and direct:
+        return direct
+    if isinstance(direct, list) and direct:
+        return str(direct[0])
+    for item in data.get("list") or []:
+        if isinstance(item, dict) and item.get("dlink"):
+            return str(item["dlink"])
+    return ""
+
+
+def _tb_dlink(meta: dict, file: dict, js_token: str = "", page_url: str = "") -> str:
+    """Pide a TeraBox el enlace directo de descarga de un archivo."""
+    sign = meta["sign"]
+    stamp = meta["timestamp"]
+    if sign and stamp:
+        params = {
+            "app_id": "250528",
+            "web": "1",
+            "channel": "dubox",
+            "clienttype": "0",
+            "scene": "purchased_list",
+            "shareid": meta["shareid"],
+            "sign": sign,
+            "timestamp": str(stamp),
+        }
+        if js_token:
+            params["jsToken"] = js_token
+        form = {
+            "product": "share",
+            "nozip": "0",
+            "fid_list": json.dumps([int(float(file["fid"]))]),
+            "uk": meta["uk"],
+            "primaryid": meta["shareid"],
+        }
+        data = _tb_http(
+            _tb_url("/share/download", params), method="POST", form=form, referer=page_url
+        )
+        if data.get("errno") == 0:
+            found = _tb_pick_dlink(data)
+            if found:
+                return found
+    sekey = unquote(meta["randsk"]) if meta["randsk"] else ""
+    legacy = _tb_http(
+        _tb_url(
+            "/api/sharedownload",
+            {
+                "app_id": "250528",
+                "web": "1",
+                "channel": "dubox",
+                "clienttype": "0",
+                "jsToken": js_token,
+                "shareid": meta["shareid"],
+                "uk": meta["uk"],
+                "sign": meta["sign"],
+                "timestamp": str(meta["timestamp"]),
+                "fid_list": json.dumps([int(float(file["fid"]))]),
+                "primaryid": meta["shareid"],
+                "product": "share",
+                "nozip": "0",
+                "type": "download",
+                "extra": json.dumps({"sekey": sekey}),
+            },
+        )
+    )
+    if legacy.get("errno") == 0:
+        found = _tb_pick_dlink(legacy)
+        if found:
+            return found
+    raise CommandError(_tb_error(legacy or {}, "descarga"))
+
+
+def _tb_resolve(link: str) -> dict:
+    """Devuelve los datos del enlace y la lista de archivos que contiene."""
+    share = terabox_share(link)
+    page: dict = {"info": {}, "items": [], "jsToken": "", "pageUrl": ""}
+    try:
+        page = _tb_page(share)
+    except CommandError:
+        # Un enlace roto no siempre trae datos en la página: pregunta a la API,
+        # que sí sabe decir si el código no existe o si caducó.
+        pass
+    try:
+        data = _tb_shorturl(share, page["jsToken"], page["pageUrl"])
+    except CommandError:
+        if not page["items"]:
+            raise
+        data = {
+            "shareid": page["info"].get("shareid") or page["info"].get("shareId"),
+            "uk": page["info"].get("uk"),
+            "sign": page["info"].get("sign"),
+            "timestamp": page["info"].get("timestamp"),
+            "randsk": page["info"].get("randsk") or page["info"].get("sekey"),
+            "list": page["items"],
+            "type": page["info"].get("type"),
+        }
+    meta = _tb_meta(data)
+    items = meta["list"] or page["items"]
+    if not items:
+        items = _tb_list(meta)
+    files: list = []
+    seen: set = set()
+    for item in items:
+        name = str(
+            item.get("server_filename") or item.get("filename") or item.get("name") or ""
+        ).strip()
+        fid = item.get("fs_id", item.get("fid", item.get("id")))
+        if fid in (None, ""):
+            continue
+        if int(item.get("isdir") or 0) == 1:
+            seen.add(str(fid))
+            for child in _tb_folder(meta, str(fid)):
+                if len(files) >= TERABOX_MAX_FILES:
+                    break
+                files.append(child)
+        else:
+            files.append(
+                {"name": name or f"archivo-{fid}", "size": item.get("size") or 0, "fid": str(fid)}
+            )
+    if not files:
+        raise CommandError("Ese enlace de TeraBox no tiene archivos que pueda descargar.")
+    return {
+        "meta": meta,
+        "files": files,
+        "jsToken": page["jsToken"],
+        "pageUrl": page["pageUrl"],
+    }
+
+
+def _tb_folder(meta: dict, fid: str, depth: int = 0) -> list:
+    """Archivos dentro de una carpeta del enlace, entrando en subcarpetas."""
+    if depth > 12:
+        return []
+    found: list = []
+    for item in _tb_list(meta, fid):
+        name = str(
+            item.get("server_filename") or item.get("filename") or item.get("name") or ""
+        ).strip()
+        item_fid = item.get("fs_id", item.get("fid", item.get("id")))
+        if item_fid in (None, ""):
+            continue
+        if int(item.get("isdir") or 0) == 1:
+            found.extend(_tb_folder(meta, str(item_fid), depth + 1))
+        else:
+            found.append(
+                {
+                    "name": name or f"archivo-{item_fid}",
+                    "size": item.get("size") or 0,
+                    "fid": str(item_fid),
+                }
+            )
+        if len(found) >= TERABOX_MAX_FILES:
+            break
+    return found
+
+
+async def cmd_terabox(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    raw = require_args(
+        context,
+        "/terabox <enlace> [número]   ej. /terabox https://www.terabox.com/s/1abcDEF 2",
+    )
+    parts = raw.split()
+    link = parts[0]
+    number = 0
+    if len(parts) > 1:
+        try:
+            number = int(parts[1])
+        except ValueError:
+            number = 0
+    if not terabox_share(link):
+        raise CommandError("Mándame el enlace completo de TeraBox.")
+    message = update.effective_message
+    try:
+        info = await asyncio.to_thread(_tb_resolve, link)
+    except (URLError, TimeoutError, OSError) as exc:
+        raise CommandError(f"No pude abrir TeraBox: {exc}")
+    files = info["files"]
+    if len(files) > 1 and not number:
+        lines = [f"📂 Ese enlace tiene {len(files)} archivos:"]
+        for position, item in enumerate(files[:TERABOX_LISTED], start=1):
+            lines.append(f"{position}. {item['name'][:70]} · {_tb_size(item['size'])}")
+        if len(files) > TERABOX_LISTED:
+            lines.append(f"… y {len(files) - TERABOX_LISTED} más")
+        lines.append(
+            "\nElige uno: /terabox " + link + " <número>"
+        )
+        await message.reply_text(
+            truncate("\n".join(lines)),
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+        return
+    if number < 0 or number > len(files):
+        raise CommandError(f"Ese enlace solo tiene {len(files)} archivo(s).")
+    chosen = files[(number or 1) - 1]
+    name = chosen["name"]
+    caption = truncate(f"📦 {name}\n📏 {_tb_size(chosen['size'])}", 1000)
+    kind = mediafire_kind("", name)
+    async with download_task(update, f"TeraBox · {name[:60]}") as job:
+        job.stage = "Pidiendo el enlace a TeraBox"
+        direct = await asyncio.to_thread(
+            _tb_dlink, info["meta"], chosen, info["jsToken"], info["pageUrl"]
+        )
+        if not direct:
+            raise CommandError("TeraBox no quiso darme el enlace de descarga de ese archivo.")
+        job.stage = "Descargando el archivo de TeraBox"
+        ok = await send_media_safely(
+            message, kind, direct, name, caption, _dl_stopped(job), job.track
+        )
+        if not ok:
+            raise CommandError(
+                "No pude descargar o enviar ese archivo (¿pasa de 45 MB?). "
+                f"Enlace directo:\n{direct}"
+            )
+
+
+# --------------------------------------------------------------------------
+# Oploverz: buscador de anime con sus enlaces de descarga
+# --------------------------------------------------------------------------
+OPLOVERZ_API = "https://backapi.oploverz.ac"
+OPLOVERZ_SITE = "https://oploverz.diy"
+OPLOVERZ_RESULTS = 5
+OPLOVERZ_EPISODES = 3
+
+
+def _oplo_json(path: str, params: dict | None = None) -> dict:
+    status, body, _ = _fetch_url(
+        _build_url(OPLOVERZ_API + path, params), "application/json", 30
+    )
+    if status != 200 or not body:
+        raise CommandError(f"Oploverz respondió HTTP {status}.")
+    try:
+        data = json.loads(body.decode("utf-8", "replace"))
+    except ValueError:
+        raise CommandError("Oploverz devolvió algo que no es JSON.")
+    return data if isinstance(data, dict) else {}
+
+
+def _oplo_search(query: str) -> list[dict]:
+    """Busca series y películas; recorre las páginas que hagan falta."""
+    found: dict[str, dict] = {}
+    page, last = 1, 1
+    while page <= last and page <= 5:
+        data = _oplo_json("/api/series", {"q": query, "page": page, "pageSize": 100})
+        for item in data.get("data") or []:
+            if isinstance(item, dict) and item.get("slug"):
+                found[str(item["slug"])] = item
+        try:
+            last = int(((data.get("meta") or {}).get("lastPage")) or page)
+        except (TypeError, ValueError):
+            last = page
+        page += 1
+    return list(found.values())
+
+
+def _oplo_episodes(slug: str) -> list[dict]:
+    """Episodios de una serie, del primero al último."""
+    episodes: list[dict] = []
+    page, last = 1, 1
+    while page <= last and page <= 3:
+        data = _oplo_json(
+            f"/api/series/{quote(slug)}/episodes", {"page": page, "pageSize": 1000}
+        )
+        for item in data.get("data") or []:
+            if isinstance(item, dict):
+                episodes.append(item)
+        try:
+            last = int(((data.get("meta") or {}).get("lastPage")) or page)
+        except (TypeError, ValueError):
+            last = page
+        page += 1
+
+    def order(item: dict) -> float:
+        try:
+            return float(str(item.get("episodeNumber") or 0).strip())
+        except (TypeError, ValueError):
+            return 0.0
+
+    return sorted(episodes, key=order)
+
+
+def _oplo_links(episode: dict) -> list[tuple[str, str, str]]:
+    """Enlaces de descarga del episodio: calidad, servidor y URL."""
+    links: list[tuple[str, str, str]] = []
+    for group in episode.get("downloadUrl") or []:
+        if not isinstance(group, dict):
+            continue
+        for resolution in group.get("resolutions") or []:
+            if not isinstance(resolution, dict):
+                continue
+            quality = str(resolution.get("quality") or "?").strip()
+            for link in resolution.get("download_links") or []:
+                if isinstance(link, dict) and link.get("url"):
+                    links.append(
+                        (quality, str(link.get("host") or "?"), str(link["url"]))
+                    )
+    preferred = [link for link in links if "720" in link[0]] or links
+    return preferred[:3]
+
+
+async def cmd_oploverz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = require_args(context, "/oploverz <anime>   ej. /oploverz jujutsu kaisen")
+    found = await asyncio.to_thread(_oplo_search, query)
+    if not found:
+        raise CommandError("No encontré ese anime en Oploverz.")
+    lines = [f"🎬 Oploverz · «{query}»"]
+    for item in found[:OPLOVERZ_RESULTS]:
+        is_movie = str(item.get("releaseType") or "").lower() == "movie"
+        details = ["película" if is_movie else "serie"]
+        if item.get("status"):
+            details.append(str(item["status"]))
+        if item.get("score"):
+            details.append(f"⭐ {item['score']}")
+        prefix = "movie" if is_movie else "series"
+        lines.append(f"• {item.get('title') or '?'} ({' · '.join(details)})")
+        lines.append(f"  {OPLOVERZ_SITE}/{prefix}/{item['slug']}")
+    best = found[0]
+    try:
+        episodes = await asyncio.to_thread(_oplo_episodes, str(best["slug"]))
+    except CommandError:
+        episodes = []
+    if episodes:
+        lines.append(f"\n📥 {best.get('title') or '?'}")
+        for episode in episodes[-OPLOVERZ_EPISODES:]:
+            number = episode.get("episodeNumber")
+            lines.append(f"• Episodio {number}" + (f" · {episode['title']}" if episode.get("title") else ""))
+            for quality, host, url in _oplo_links(episode):
+                lines.append(f"  {quality} · {host}: {url}")
+    await update.effective_message.reply_text(
+        truncate("\n".join(lines)),
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+
+
 HANDLERS = {
     "start": cmd_start,
     "menu": cmd_menu,
@@ -7139,6 +7910,9 @@ HANDLERS = {
     "tiktok": cmd_tiktok,
     "fbstalk": cmd_fbstalk,
     "mediafire": cmd_mediafire,
+    "terabox": cmd_terabox,
+    "oploverz": cmd_oploverz,
+    "humanizar": cmd_humanizar,
     "tourl": cmd_tourl,
     "captura": cmd_captura,
     "ia": cmd_ia,
