@@ -47,10 +47,11 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from http.cookiejar import CookieJar
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, unquote, unquote_plus, urlencode, urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 from xml.etree import ElementTree
 
 import telegram
@@ -83,7 +84,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.33"
+VERSION = "3.34"
 START_TIME = time.time()
 LAST_UPDATE_CHECK = START_TIME
 
@@ -226,7 +227,7 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("fbstalk", " <enlace>", "info de un vídeo o perfil de Facebook"),
     ("mediafire", " <enlace>", "descarga un archivo de MediaFire"),
     ("terabox", " <enlace> [número]", "descarga un archivo de TeraBox"),
-    ("oploverz", " <anime> [ep12]", "busca un anime en Oploverz con enlaces probados"),
+    ("oploverz", " <anime> [ep12]", "busca un anime en Oploverz y te manda el archivo"),
     ("tourl", " <url>", "sube un archivo y devuelve enlaces"),
     ("captura", " <url>", "captura de pantalla de una web"),
     ("ia", " <pregunta>", "pregúntale a la IA DeepSeek"),
@@ -7747,7 +7748,13 @@ OPLOVERZ_DOMAINS = {
 }
 OPLOVERZ_QUALITIES = ("720p", "1080p", "480p", "360p")
 OPLOVERZ_HOST_ORDER = ("FILEDON", "BUZZ", "GD", "AKIRA")
+# Servidores desde los que el bot puede bajar el archivo en vez de solo dar el enlace
+OPLOVERZ_SEND_HOSTS = ("filedon.co", "pixeldrain.com")
+OPLOVERZ_SEND_LIMIT = 45 * 1024 * 1024  # máximo que acepta Telegram por mensaje
+OPLOVERZ_SEND_PARTS = 8  # tope de trozos (8 × 45 MB)
+OPLOVERZ_BUTTONS = 10  # botones de descarga por respuesta
 _OPLOVERZ_CACHE: dict[str, tuple[str, str, float]] = {}
+_OPLOVERZ_SEND: dict[str, dict] = {}
 _OPLOVERZ_EP_ARG = re.compile(
     r"^(?P<query>.*?)\s*(?:ep\.?|cap\.?|episodio|#)\s*(?P<ep>\d{1,4})$", re.I
 )
@@ -7952,7 +7959,7 @@ def _oplo_probe(url: str) -> tuple[str, str]:
         return cached[0], cached[1]
 
     state, detail = "duda", ""
-    wants_size = "filedon.co/view/" in url
+    wants_size = "filedon.co/view/" in url or "uploadwith.me/f/" in url
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/octet-stream;q=0.9,*/*;q=0.8",
@@ -8011,6 +8018,233 @@ def _oplo_check(
         return {}
     with ThreadPoolExecutor(max_workers=12) as pool:
         return dict(zip(urls, pool.map(_oplo_probe, urls)))
+
+
+def _oplo_can_send(url: str) -> bool:
+    """¿Se puede bajar el archivo de ese servidor para mandarlo por Telegram?"""
+    host = (urlsplit(url).netloc or "").lower().removeprefix("www.")
+    return any(host == known or host.endswith("." + known) for known in OPLOVERZ_SEND_HOSTS)
+
+
+def _oplo_filedon(url: str) -> tuple[str, str, int]:
+    """Enlace firmado de Filedon: la página da el token y de ahí sale la descarga.
+
+    Filedon es Laravel + Inertia: hay que abrir la ficha con cookies, pedir
+    `POST /download/<slug>` con el token CSRF y leer `flash.download_url`.
+    """
+    parts = [part for part in urlsplit(url).path.split("/") if part]
+    slug = parts[-1] if parts else ""
+    if not slug:
+        raise CommandError("Ese enlace de Filedon no tiene identificador.")
+    view = f"https://filedon.co/view/{quote(slug)}"
+    opener = build_opener(HTTPCookieProcessor(CookieJar()))
+    base = {"User-Agent": USER_AGENT, "Accept-Language": "es,en;q=0.8"}
+    try:
+        with opener.open(
+            Request(view, headers={**base, "Accept": "text/html"}), timeout=40
+        ) as response:
+            page = response.read(600_000).decode("utf-8", "replace")
+    except HTTPError as exc:
+        code = exc.code
+        exc.close()
+        raise CommandError(f"Filedon respondió HTTP {code} al abrir el archivo.")
+    except (URLError, TimeoutError, OSError) as exc:
+        raise CommandError(f"No pude abrir Filedon: {exc}")
+
+    page = html.unescape(page)
+    name = re.search(r'"files":\{[^{}]*?"name":"([^"]+)"', page)
+    size = re.search(r'"size":(\d{5,})', page)
+    token = re.search(r'name="csrf-token" content="([^"]+)"', page)
+    version = re.search(r'"version":"([0-9a-f]{16,})"', page)
+    headers = {
+        **base,
+        "Accept": "text/html, application/xhtml+xml",
+        "Content-Type": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+        "X-Inertia": "true",
+        "Referer": view,
+        "Origin": "https://filedon.co",
+    }
+    if token:
+        headers["X-CSRF-TOKEN"] = token.group(1)
+    if version:
+        headers["X-Inertia-Version"] = version.group(1)
+    try:
+        with opener.open(
+            Request(
+                f"https://filedon.co/download/{quote(slug)}",
+                data=b"{}",
+                headers=headers,
+                method="POST",
+            ),
+            timeout=60,
+        ) as response:
+            answer = response.read(2_000_000)
+    except HTTPError as exc:
+        code = exc.code
+        exc.close()
+        raise CommandError(f"Filedon no dejó descargar el archivo (HTTP {code}).")
+    except (URLError, TimeoutError, OSError) as exc:
+        raise CommandError(f"Filedon cortó la petición de descarga: {exc}")
+    try:
+        data = json.loads(answer.decode("utf-8", "replace"))
+    except ValueError:
+        data = {}
+    flash = ((data.get("props") or {}).get("flash") or {}) if isinstance(data, dict) else {}
+    direct = str(flash.get("download_url") or "")
+    if not direct:
+        raise CommandError("Filedon no devolvió el enlace de descarga del archivo.")
+    filename = ""
+    if name:
+        filename = Path(html.unescape(name.group(1))).name
+    if not filename:
+        filename = f"oploverz-{slug}"
+    if not Path(filename).suffix:
+        filename += Path(urlsplit(direct).path).suffix or ".mp4"
+    return direct, filename, int(size.group(1)) if size else 0
+
+
+def _oplo_pixeldrain(url: str) -> tuple[str, str, int]:
+    """PixelDrain tiene API: /api/file/<id>?download es el archivo tal cual."""
+    parts = [part for part in urlsplit(url).path.split("/") if part]
+    ident = parts[-1] if parts else ""
+    if not ident:
+        raise CommandError("Ese enlace de PixelDrain no tiene identificador.")
+    name, size = f"pixeldrain-{ident}", 0
+    status, body, _ = _fetch_url(
+        f"https://pixeldrain.com/api/file/{quote(ident)}/info", "application/json", 30
+    )
+    if status == 200 and body:
+        try:
+            info = json.loads(body.decode("utf-8", "replace"))
+            if isinstance(info, dict):
+                name = str(info.get("name") or name)
+                size = int(info.get("size") or 0)
+        except (ValueError, TypeError):
+            pass
+    return f"https://pixeldrain.com/api/file/{quote(ident)}?download", name, size
+
+
+def _oplo_direct(url: str) -> tuple[str, str, int]:
+    """Enlace directo, nombre y peso de un enlace de descarga de Oploverz."""
+    host = (urlsplit(url).netloc or "").lower().removeprefix("www.")
+    if host == "filedon.co" or host.endswith(".filedon.co"):
+        return _oplo_filedon(url)
+    if host == "pixeldrain.com" or host.endswith(".pixeldrain.com"):
+        return _oplo_pixeldrain(url)
+    raise CommandError(
+        f"{_oplo_host('', url)} no deja descargar el archivo desde el bot; "
+        "abre su enlace en el navegador."
+    )
+
+
+def _oplo_download(direct: str, path: Path, job: DownloadJob, size: int = 0) -> int:
+    """Baja el archivo a disco por trozos (así no se llena la memoria)."""
+    request = Request(direct, headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
+    total = 0
+    try:
+        with urlopen(request, timeout=120) as response:
+            expected = _size_bytes(response.headers.get("Content-Length")) or size
+            job.track(0, expected)
+            with path.open("wb") as handle:
+                while True:
+                    if job.cancelled:
+                        raise DownloadCancelled("Descarga cancelada ⛔️")
+                    chunk = response.read(256 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > OPLOVERZ_SEND_LIMIT * OPLOVERZ_SEND_PARTS:
+                        raise CommandError(
+                            "Ese archivo es demasiado grande para mandarlo por Telegram."
+                        )
+                    handle.write(chunk)
+                    job.track(total, expected)
+    except HTTPError as exc:
+        code = exc.code
+        exc.close()
+        raise CommandError(f"El servidor cortó la descarga (HTTP {code}).")
+    except (URLError, TimeoutError, OSError) as exc:
+        raise CommandError(f"Se cortó la descarga: {exc}")
+    if not total:
+        raise CommandError("El archivo llegó vacío.")
+    return total
+
+
+async def _oplo_deliver(message, job: DownloadJob, payload: dict) -> None:
+    """Baja el archivo elegido y lo manda (en partes si pasa de 45 MB)."""
+    job.stage = f"Pidiendo el enlace a {_oplo_host('', payload['url'])}"
+    direct, name, size = await asyncio.to_thread(_oplo_direct, payload["url"])
+    if size > OPLOVERZ_SEND_LIMIT * OPLOVERZ_SEND_PARTS:
+        raise CommandError(
+            f"Pesa {_oplo_size(size)}: es demasiado para mandarlo por Telegram. "
+            f"Enlace directo:\n{direct}"
+        )
+    job.stage = "Descargando el archivo"
+    with tempfile.TemporaryDirectory(prefix="oplo-") as folder:
+        path = Path(folder) / "archivo"
+        total = await asyncio.to_thread(_oplo_download, direct, path, job, size)
+        job.begin()
+        parts = max(1, -(-total // OPLOVERZ_SEND_LIMIT))
+        suffix = Path(name).suffix or Path(urlsplit(direct).path).suffix or ".mp4"
+        stem = re.sub(r"[^\w.\- ]+", "", Path(name).stem)[:60] or "oploverz"
+        human = _oplo_size(total)
+        caption_start = f"🎬 {payload['title']} · {payload['label']}"
+        with path.open("rb") as handle:
+            for index in range(1, parts + 1):
+                blob = handle.read(OPLOVERZ_SEND_LIMIT)
+                if not blob:
+                    break
+                if parts > 1:
+                    caption = truncate(
+                        f"{caption_start}\nParte {index}/{parts} · {human} en total\n"
+                        "Junta las partes con 7-Zip (o «cat»).",
+                        1000,
+                    )
+                    await message.reply_document(
+                        document=blob,
+                        filename=f"{stem}.parte{index}de{parts}{suffix}",
+                        caption=caption,
+                    )
+                    continue
+                caption = truncate(f"{caption_start}\n📁 {name}\n📏 {human}", 1000)
+                if suffix.lower() in (".mp4", ".m4v", ".mov"):
+                    try:
+                        await message.reply_video(
+                            video=blob,
+                            filename=name,
+                            caption=caption,
+                            supports_streaming=True,
+                        )
+                        continue
+                    except TelegramError:
+                        pass
+                await message.reply_document(
+                    document=blob, filename=name, caption=caption
+                )
+
+
+async def on_oplo_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Botón «⬇️» de /oploverz: baja el archivo y lo manda al chat."""
+    query = update.callback_query
+    if query is None:
+        return
+    payload = _OPLOVERZ_SEND.get((query.data or "")[3:])
+    if not payload:
+        await query.answer(
+            "Ese botón ya caducó (o el bot se reinició): vuelve a buscarlo con /oploverz.",
+            show_alert=True,
+        )
+        return
+    await query.answer("⬇️ Preparando el archivo…")
+    message = update.effective_message
+    try:
+        async with download_task(update, f"Oploverz · {payload['label']}") as job:
+            await _oplo_deliver(message, job, payload)
+    except DownloadCancelled:
+        return
+    except CommandError as exc:
+        await message.reply_text(f"⚠️ {exc}")
 
 
 def _oplo_parse_query(raw: str) -> tuple[str, int | None, bool]:
@@ -8091,6 +8325,7 @@ async def cmd_oploverz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except CommandError:
         episodes = []
 
+    buttons: list[list[InlineKeyboardButton]] = []
     if not episodes:
         lines.extend(
             ["", "La API no tiene episodios con enlaces; abre la ficha de arriba."]
@@ -8108,9 +8343,12 @@ async def cmd_oploverz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         status = await asyncio.to_thread(
             _oplo_check, [link for _, links in plan for link in links]
         )
+        if len(_OPLOVERZ_SEND) > 1500:
+            _OPLOVERZ_SEND.clear()
         for episode, candidates in plan:
             number = str(episode.get("episodeNumber") or "").strip()
             label = "película" if is_movie else f"episodio {number}"
+            short = "película" if is_movie else f"ep{number}"
             lines.extend(["", f"📥 {best.get('title') or '?'} · {label}"])
             online = _oplo_online(episode)
             if online:
@@ -8130,12 +8368,27 @@ async def cmd_oploverz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     note = " · se abre en el navegador"
                 elif state == "duda":
                     note = " · sin confirmar"
+                elif not _oplo_can_send(url):
+                    note = " · sin descarga directa"
                 size = f" · {extra}" if extra else ""
                 lines.append(
                     f"   • {_oplo_format(fmt)} {quality.lower()} · "
                     f"{_oplo_host(host, url)}{size}{note}"
                 )
                 lines.append(f"     {url}")
+                if _oplo_can_send(url) and len(buttons) < OPLOVERZ_BUTTONS:
+                    token = uuid.uuid4().hex[:8]
+                    _OPLOVERZ_SEND[token] = {
+                        "url": url,
+                        "title": str(best.get("title") or "?"),
+                        "label": f"{short} · {_oplo_format(fmt)} {quality.lower()}",
+                    }
+                    text = f"⬇️ {short} · {_oplo_format(fmt)} {quality.lower()}"
+                    if extra:
+                        text += f" · {extra}"
+                    buttons.append(
+                        [InlineKeyboardButton(text[:60], callback_data=f"op:{token}")]
+                    )
             if not shown:
                 lines.append(
                     "   • Ahora mismo no hay ningún enlace vivo (los servidores "
@@ -8144,9 +8397,18 @@ async def cmd_oploverz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             if dead:
                 lines.append(f"   ({dead} enlace(s) caído(s) omitidos)")
             lines.append(f"   🔗 {_oplo_episode_url(best, number)}")
+    if buttons:
+        lines.extend(
+            [
+                "",
+                "👇 Toca un botón y te mando el archivo. Si pasa de 45 MB "
+                "(lo que deja Telegram) va en partes para unirlas.",
+            ]
+        )
 
     await update.effective_message.reply_text(
         truncate("\n".join(lines)),
+        reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
         link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
 
@@ -8313,6 +8575,7 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CallbackQueryHandler(on_update_callback, pattern=r"^upd:"))
     application.add_handler(CallbackQueryHandler(on_reminder_callback, pattern=r"^rm:"))
     application.add_handler(CallbackQueryHandler(on_download_callback, pattern=r"^dl:"))
+    application.add_handler(CallbackQueryHandler(on_oplo_send, pattern=r"^op:"))
     application.add_handler(InlineQueryHandler(on_inline))
 
 
