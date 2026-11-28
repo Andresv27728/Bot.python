@@ -44,6 +44,7 @@ import tempfile
 import time
 import unicodedata
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -82,7 +83,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.32"
+VERSION = "3.33"
 START_TIME = time.time()
 LAST_UPDATE_CHECK = START_TIME
 
@@ -225,7 +226,7 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("fbstalk", " <enlace>", "info de un vídeo o perfil de Facebook"),
     ("mediafire", " <enlace>", "descarga un archivo de MediaFire"),
     ("terabox", " <enlace> [número]", "descarga un archivo de TeraBox"),
-    ("oploverz", " <anime>", "busca un anime en Oploverz con sus enlaces"),
+    ("oploverz", " <anime> [ep12]", "busca un anime en Oploverz con enlaces probados"),
     ("tourl", " <url>", "sube un archivo y devuelve enlaces"),
     ("captura", " <url>", "captura de pantalla de una web"),
     ("ia", " <pregunta>", "pregúntale a la IA DeepSeek"),
@@ -7706,12 +7707,53 @@ async def cmd_terabox(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 # --------------------------------------------------------------------------
-# Oploverz: buscador de anime con sus enlaces de descarga
+# Oploverz: buscador de anime con enlaces de descarga comprobados
 # --------------------------------------------------------------------------
 OPLOVERZ_API = "https://backapi.oploverz.ac"
 OPLOVERZ_SITE = "https://oploverz.diy"
 OPLOVERZ_RESULTS = 5
 OPLOVERZ_EPISODES = 3
+OPLOVERZ_LINKS_PER_EPISODE = 4
+OPLOVERZ_LINKS_ONE_EPISODE = 6
+OPLOVERZ_PROBE_TIMEOUT = 8
+OPLOVERZ_PROBE_CACHE_TTL = 900
+OPLOVERZ_HOST_NAMES = {
+    "GD": "Acefile",
+    "AKIRA": "Akirabox",
+    "FILEDON": "Filedon",
+    "BUZZ": "Buzzheavier",
+    "GDRIVE": "Google Drive",
+    "PIXELDRAIN": "PixelDrain",
+    "MEGA": "MEGA",
+    "GOFILE": "GoFile",
+}
+OPLOVERZ_DOMAINS = {
+    "filedon.co": "Filedon",
+    "acefile.co": "Acefile",
+    "akirabox.com": "Akirabox",
+    "akirabox.to": "Akirabox",
+    "buzzheavier.com": "Buzzheavier",
+    "pixeldrain.com": "PixelDrain",
+    "vikingfile.com": "Viking",
+    "fileq.net": "Fileq",
+    "uploadwith.me": "UploadWith",
+    "upbolt.to": "Upbolt",
+    "mega.nz": "MEGA",
+    "drive.google.com": "Google Drive",
+    "mediafire.com": "MediaFire",
+    "gofile.io": "GoFile",
+    "1fichier.com": "1fichier",
+    "krakenfiles.com": "KrakenFiles",
+}
+OPLOVERZ_QUALITIES = ("720p", "1080p", "480p", "360p")
+OPLOVERZ_HOST_ORDER = ("FILEDON", "BUZZ", "GD", "AKIRA")
+_OPLOVERZ_CACHE: dict[str, tuple[str, str, float]] = {}
+_OPLOVERZ_EP_ARG = re.compile(
+    r"^(?P<query>.*?)\s*(?:ep\.?|cap\.?|episodio|#)\s*(?P<ep>\d{1,4})$", re.I
+)
+_OPLOVERZ_LAST_ARG = re.compile(
+    r"^(?P<query>.*?)\s*(?:ultimo|último|last)$", re.I
+)
 
 
 def _oplo_json(path: str, params: dict | None = None) -> dict:
@@ -7731,7 +7773,7 @@ def _oplo_search(query: str) -> list[dict]:
     """Busca series y películas; recorre las páginas que hagan falta."""
     found: dict[str, dict] = {}
     page, last = 1, 1
-    while page <= last and page <= 5:
+    while page <= last and page <= 3:
         data = _oplo_json("/api/series", {"q": query, "page": page, "pageSize": 100})
         for item in data.get("data") or []:
             if isinstance(item, dict) and item.get("slug"):
@@ -7745,7 +7787,7 @@ def _oplo_search(query: str) -> list[dict]:
 
 
 def _oplo_episodes(slug: str) -> list[dict]:
-    """Episodios de una serie, del primero al último."""
+    """Episodios de una serie (o de una película), del primero al último."""
     episodes: list[dict] = []
     page, last = 1, 1
     while page <= last and page <= 3:
@@ -7760,68 +7802,353 @@ def _oplo_episodes(slug: str) -> list[dict]:
         except (TypeError, ValueError):
             last = page
         page += 1
-
-    def order(item: dict) -> float:
-        try:
-            return float(str(item.get("episodeNumber") or 0).strip())
-        except (TypeError, ValueError):
-            return 0.0
-
-    return sorted(episodes, key=order)
+    return sorted(episodes, key=_oplo_number)
 
 
-def _oplo_links(episode: dict) -> list[tuple[str, str, str]]:
-    """Enlaces de descarga del episodio: calidad, servidor y URL."""
-    links: list[tuple[str, str, str]] = []
+def _oplo_number(episode: dict) -> float:
+    try:
+        return float(str(episode.get("episodeNumber") or 0).strip())
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _oplo_is_movie(item: dict) -> bool:
+    return str(item.get("releaseType") or "").strip().lower() == "movie"
+
+
+def _oplo_series_url(item: dict) -> str:
+    kind = "movie" if _oplo_is_movie(item) else "series"
+    return f"{OPLOVERZ_SITE}/{kind}/{item.get('slug')}"
+
+
+def _oplo_episode_url(item: dict, number: str) -> str:
+    if _oplo_is_movie(item):
+        return _oplo_series_url(item)
+    return f"{_oplo_series_url(item)}/episode/{number}"
+
+
+def _oplo_online(episode: dict) -> str:
+    """Enlace del reproductor que mejor suele responder."""
+    fallback = ""
+    for item in episode.get("streamUrl") or []:
+        if not isinstance(item, dict) or not item.get("url"):
+            continue
+        url = str(item["url"])
+        source = str(item.get("source") or "")
+        if "filedon.co/embed/" in url:
+            return url
+        if not fallback and "360" not in source:
+            fallback = url
+    if fallback:
+        return fallback
+    for item in episode.get("streamUrl") or []:
+        if isinstance(item, dict) and item.get("url"):
+            return str(item["url"])
+    return ""
+
+
+def _oplo_format(fmt: str) -> str:
+    """Etiqueta corta del formato: mp4, mkv o x265."""
+    clean = str(fmt or "").strip().lower()
+    if "x265" in clean or "hemat" in clean:
+        return "x265"
+    if clean.startswith("mkv"):
+        return "mkv"
+    if clean.startswith("mp4"):
+        return "mp4"
+    return clean[:8] or "?"
+
+
+def _oplo_words(text: str) -> list[str]:
+    plain = unicodedata.normalize("NFKD", text.lower())
+    plain = "".join(ch for ch in plain if not unicodedata.combining(ch))
+    return [word for word in re.split(r"[^a-z0-9]+", plain) if word]
+
+
+def _oplo_best(found: list[dict], query: str) -> dict:
+    """El resultado que de verdad corresponde a lo que se buscó.
+
+    La API a veces pone delante spin-offs (buscar «one piece» daba
+    «One Piece: Heroines»), así que se premia cubrir la búsqueda y se
+    castiga el título con palabras de más.
+    """
+    wanted = _oplo_words(query)
+    best, best_key = found[0], None
+    for index, item in enumerate(found):
+        title = _oplo_words(str(item.get("title") or ""))
+        coverage = (
+            sum(1 for word in wanted if word in title) / len(wanted) if wanted else 0
+        )
+        extra = len([word for word in title if word not in wanted])
+        key = (-coverage, extra, index)
+        if best_key is None or key < best_key:
+            best, best_key = item, key
+    return best
+
+
+def _oplo_host(host: str, url: str = "") -> str:
+    """Nombre del servidor: mejor el dominio real, porque la API a veces
+    etiqueta mal (pone «One Drive» y el enlace es de PixelDrain)."""
+    try:
+        domain = (urlsplit(url).netloc or "").lower().removeprefix("www.")
+    except ValueError:
+        domain = ""
+    for known, name in OPLOVERZ_DOMAINS.items():
+        if domain == known or domain.endswith("." + known):
+            return name
+    key = str(host or "").strip().upper()
+    return OPLOVERZ_HOST_NAMES.get(key, key.title() or "?")
+
+
+def _oplo_size(value: int) -> str:
+    if value >= 1024 ** 3:
+        return f"{value / 1024 ** 3:.1f} GB".replace(".0 GB", " GB")
+    if value >= 1024 ** 2:
+        return f"{value / 1024 ** 2:.0f} MB"
+    return f"{max(1, value // 1024)} KB"
+
+
+def _oplo_candidates(episode: dict) -> list[tuple[str, str, str, str]]:
+    """(formato, calidad, servidor, url) de lo más útil a lo menos."""
+    items: list[tuple[str, str, str, str]] = []
     for group in episode.get("downloadUrl") or []:
         if not isinstance(group, dict):
             continue
+        fmt = str(group.get("format") or "?").strip()
         for resolution in group.get("resolutions") or []:
             if not isinstance(resolution, dict):
                 continue
             quality = str(resolution.get("quality") or "?").strip()
             for link in resolution.get("download_links") or []:
                 if isinstance(link, dict) and link.get("url"):
-                    links.append(
-                        (quality, str(link.get("host") or "?"), str(link["url"]))
+                    items.append(
+                        (fmt, quality, str(link.get("host") or "?"), str(link["url"]))
                     )
-    preferred = [link for link in links if "720" in link[0]] or links
-    return preferred[:3]
+
+    def rank(item: tuple[str, str, str, str]) -> tuple[int, int, int]:
+        fmt, quality, host, _ = item
+        clean = quality.lower().replace(" ", "")
+        try:
+            quality_rank = OPLOVERZ_QUALITIES.index(clean)
+        except ValueError:
+            quality_rank = len(OPLOVERZ_QUALITIES)
+        upper = host.upper()
+        host_rank = (
+            OPLOVERZ_HOST_ORDER.index(upper)
+            if upper in OPLOVERZ_HOST_ORDER
+            else len(OPLOVERZ_HOST_ORDER)
+        )
+        fmt_rank = 0 if fmt.lower().startswith("mp4") else 1
+        return (quality_rank, fmt_rank, host_rank)
+
+    return sorted(items, key=rank)
+
+
+def _oplo_probe(url: str) -> tuple[str, str]:
+    """Comprueba un enlace: ok, bloqueado (Cloudflare), duda o muerto."""
+    now = time.time()
+    cached = _OPLOVERZ_CACHE.get(url)
+    if cached and now - cached[2] < OPLOVERZ_PROBE_CACHE_TTL:
+        return cached[0], cached[1]
+
+    state, detail = "duda", ""
+    wants_size = "filedon.co/view/" in url
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/octet-stream;q=0.9,*/*;q=0.8",
+        "Accept-Language": "es,en;q=0.8",
+    }
+    attempts: list[tuple[str, dict]] = (
+        [("GET", {"Range": "bytes=0-262143"})]
+        if wants_size
+        else [("HEAD", {}), ("GET", {"Range": "bytes=0-2047"})]
+    )
+    for method, extra in attempts:
+        body = b""
+        mitigated = ""
+        try:
+            request = Request(url, method=method, headers={**headers, **extra})
+            with urlopen(request, timeout=OPLOVERZ_PROBE_TIMEOUT) as response:
+                status = response.status
+                body = b"" if method == "HEAD" else response.read(262144)
+        except HTTPError as exc:
+            status = exc.code
+            mitigated = (exc.headers.get("cf-mitigated") if exc.headers else "") or ""
+            try:
+                exc.close()
+            except Exception:  # noqa: BLE001 - cerrar nunca debe romper la comprobación
+                pass
+        except (URLError, OSError, ValueError):
+            continue
+
+        if status in (200, 206):
+            state = "ok"
+            if wants_size and body:
+                match = re.search(rb'(?:&quot;|")size(?:&quot;|")\s*:\s*(\d{5,})', body)
+                if match:
+                    detail = _oplo_size(int(match.group(1)))
+            break
+        if status in (404, 410):
+            state = "muerto"
+            break
+        if mitigated == "challenge" or status in (401, 403, 429):
+            state = "bloqueado"
+            break
+        state = "duda"
+
+    if len(_OPLOVERZ_CACHE) > 500:
+        _OPLOVERZ_CACHE.clear()
+    _OPLOVERZ_CACHE[url] = (state, detail, now)
+    return state, detail
+
+
+def _oplo_check(
+    links: list[tuple[str, str, str, str]]
+) -> dict[str, tuple[str, str]]:
+    """Comprueba todos los enlaces en paralelo y devuelve el estado por URL."""
+    urls = list(dict.fromkeys(url for *_, url in links))
+    if not urls:
+        return {}
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        return dict(zip(urls, pool.map(_oplo_probe, urls)))
+
+
+def _oplo_parse_query(raw: str) -> tuple[str, int | None, bool]:
+    """Separa el anime de un «ep12» o «ultimo» opcional."""
+    text = " ".join(raw.split())
+    match = _OPLOVERZ_EP_ARG.match(text)
+    if match and match.group("query").strip():
+        return match.group("query").strip(), int(match.group("ep")), False
+    match = _OPLOVERZ_LAST_ARG.match(text)
+    if match and match.group("query").strip():
+        return match.group("query").strip(), None, True
+    return text, None, False
+
+
+def _oplo_targets(
+    episodes: list[dict], wanted: int | None, last_only: bool
+) -> list[dict]:
+    if last_only:
+        return episodes[-1:]
+    if wanted is None:
+        return episodes[-OPLOVERZ_EPISODES:]
+    for episode in episodes:
+        if abs(_oplo_number(episode) - float(wanted)) < 0.001:
+            return [episode]
+    first = int(_oplo_number(episodes[0]))
+    final = int(_oplo_number(episodes[-1]))
+    raise CommandError(
+        f"Ese anime no tiene el episodio {wanted}; hay del {first} al {final}."
+    )
 
 
 async def cmd_oploverz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = require_args(context, "/oploverz <anime>   ej. /oploverz jujutsu kaisen")
+    raw = require_args(
+        context, "/oploverz <anime> [ep12]   ej. /oploverz jujutsu kaisen ep12"
+    )
+    query, wanted, last_only = _oplo_parse_query(raw)
     found = await asyncio.to_thread(_oplo_search, query)
     if not found:
-        raise CommandError("No encontré ese anime en Oploverz.")
-    lines = [f"🎬 Oploverz · «{query}»"]
-    for item in found[:OPLOVERZ_RESULTS]:
-        is_movie = str(item.get("releaseType") or "").lower() == "movie"
-        details = ["película" if is_movie else "serie"]
-        if item.get("status"):
-            details.append(str(item["status"]))
-        if item.get("score"):
-            details.append(f"⭐ {item['score']}")
-        prefix = "movie" if is_movie else "series"
-        lines.append(f"• {item.get('title') or '?'} ({' · '.join(details)})")
-        lines.append(f"  {OPLOVERZ_SITE}/{prefix}/{item['slug']}")
-    best = found[0]
+        raise CommandError(f"No encontré «{query}» en Oploverz.")
+
+    best = _oplo_best(found, query)
+    is_movie = _oplo_is_movie(best)
+    details = ["película" if is_movie else "serie"]
+    if best.get("status"):
+        details.append(str(best["status"]))
+    if best.get("totalEpisodes") and not is_movie:
+        details.append(f"{best['totalEpisodes']} eps")
+    if best.get("score"):
+        details.append(f"⭐ {best['score']}")
+    year = str(best.get("releaseDate") or "")[:4]
+    if year.isdigit():
+        details.append(year)
+
+    lines = [
+        f"🎬 Oploverz · «{query}»",
+        "",
+        f"Elegido: {best.get('title') or '?'}",
+        f"   {' · '.join(details)}",
+        f"   {_oplo_series_url(best)}",
+    ]
+    others = [
+        item
+        for item in found[1:OPLOVERZ_RESULTS]
+        if item.get("slug") != best.get("slug")
+    ]
+    if others:
+        lines.append("")
+        lines.append("Otros resultados:")
+        for item in others:
+            other_year = str(item.get("releaseDate") or "")[:4]
+            kind = "película" if _oplo_is_movie(item) else "serie"
+            suffix = f", {other_year}" if other_year.isdigit() else ""
+            lines.append(f"• {item.get('title') or '?'} ({kind}{suffix})")
+            lines.append(f"   {_oplo_series_url(item)}")
+
     try:
         episodes = await asyncio.to_thread(_oplo_episodes, str(best["slug"]))
     except CommandError:
         episodes = []
-    if episodes:
-        lines.append(f"\n📥 {best.get('title') or '?'}")
-        for episode in episodes[-OPLOVERZ_EPISODES:]:
-            number = episode.get("episodeNumber")
-            lines.append(f"• Episodio {number}" + (f" · {episode['title']}" if episode.get("title") else ""))
-            for quality, host, url in _oplo_links(episode):
-                lines.append(f"  {quality} · {host}: {url}")
+
+    if not episodes:
+        lines.extend(
+            ["", "La API no tiene episodios con enlaces; abre la ficha de arriba."]
+        )
+    else:
+        targets = _oplo_targets(episodes, wanted, last_only)
+        limit = (
+            OPLOVERZ_LINKS_ONE_EPISODE
+            if (wanted is not None or last_only)
+            else OPLOVERZ_LINKS_PER_EPISODE
+        )
+        plan = [
+            (episode, _oplo_candidates(episode)[: limit + 5]) for episode in targets
+        ]
+        status = await asyncio.to_thread(
+            _oplo_check, [link for _, links in plan for link in links]
+        )
+        for episode, candidates in plan:
+            number = str(episode.get("episodeNumber") or "").strip()
+            label = "película" if is_movie else f"episodio {number}"
+            lines.extend(["", f"📥 {best.get('title') or '?'} · {label}"])
+            online = _oplo_online(episode)
+            if online:
+                lines.append(f"   ▶️ Ver online: {online}")
+            shown = 0
+            dead = 0
+            for fmt, quality, host, url in candidates:
+                state, extra = status.get(url, ("duda", ""))
+                if state == "muerto":
+                    dead += 1
+                    continue
+                if shown >= limit:
+                    break
+                shown += 1
+                note = ""
+                if state == "bloqueado":
+                    note = " · se abre en el navegador"
+                elif state == "duda":
+                    note = " · sin confirmar"
+                size = f" · {extra}" if extra else ""
+                lines.append(
+                    f"   • {_oplo_format(fmt)} {quality.lower()} · "
+                    f"{_oplo_host(host, url)}{size}{note}"
+                )
+                lines.append(f"     {url}")
+            if not shown:
+                lines.append(
+                    "   • Ahora mismo no hay ningún enlace vivo (los servidores "
+                    "los tumban a menudo)."
+                )
+            if dead:
+                lines.append(f"   ({dead} enlace(s) caído(s) omitidos)")
+            lines.append(f"   🔗 {_oplo_episode_url(best, number)}")
+
     await update.effective_message.reply_text(
         truncate("\n".join(lines)),
         link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
-
 
 HANDLERS = {
     "start": cmd_start,
