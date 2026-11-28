@@ -84,7 +84,7 @@ SELF_PATH = Path(__file__).resolve()
 TOKEN_FILE = SELF_PATH.with_name("token.txt")
 TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
 
-VERSION = "3.34"
+VERSION = "3.35"
 START_TIME = time.time()
 LAST_UPDATE_CHECK = START_TIME
 
@@ -195,7 +195,7 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("claves", "", "estado de las claves de APIs"),
     ("iss", "", "dónde está la Estación Espacial Internacional"),
     ("arte", " <búsqueda>", "obras de arte del museo de Chicago"),
-    ("poema", " [autor]", "un poema al azar (o de un autor)"),
+    ("poema", " [autor]", "un poema en español al azar (o de un autor)"),
     ("consejo", "", "un consejo al azar, en inglés y español"),
     ("nombre", " <nombre>", "edad, género y país probables de un nombre"),
     ("feriados", " <código país> [año]", "feriados oficiales (ej. /feriados CO)"),
@@ -2593,33 +2593,256 @@ async def cmd_arte(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text(truncate(text))
 
 
-async def poem_report(author: str | None) -> str:
-    if author:
-        titles = await http_json(
-            f"https://poetrydb.org/author/{quote(author, safe='')}/title"
-        )
-        if not isinstance(titles, list) or not titles:
-            raise CommandError(f"No encontré poemas de «{author}».")
-        title = str(random.choice(titles).get("title") or "")
-        poems = await http_json(f"https://poetrydb.org/title/{quote(title, safe='')}")
-    else:
-        poems = await http_json("https://poetrydb.org/random/1")
-    if not isinstance(poems, list) or not poems:
-        raise CommandError("PoetryDB no devolvió ningún poema. Prueba otra vez.")
-    poem = poems[0]
-    lines = [str(line) for line in (poem.get("lines") or [])]
-    body = "\n".join(lines[:18])
-    if len(lines) > 18:
-        body += "\n…"
-    return (
-        f"📜 {poem.get('title') or 'Sin título'}\n"
-        f"✍️ {poem.get('author') or 'Anónimo'}\n\n{body}\n\n📚 poetrydb.org"
+POEMAS: list[tuple[str, str, tuple[str, ...]]] = [
+    (
+        "Rima XXI",
+        "Gustavo Adolfo Bécquer",
+        (
+            "¿Qué es poesía?, dices mientras clavas",
+            "en mi pupila tu pupila azul.",
+            "¡Qué es poesía! ¿Y tú me lo preguntas?",
+            "Poesía... eres tú.",
+        ),
+    ),
+    (
+        "Rima XXIII",
+        "Gustavo Adolfo Bécquer",
+        (
+            "Por una mirada, un mundo;",
+            "por una sonrisa, un cielo;",
+            "por un beso... yo no sé",
+            "qué te diera por un beso.",
+        ),
+    ),
+    (
+        "Rima LIII",
+        "Gustavo Adolfo Bécquer",
+        (
+            "Volverán las oscuras golondrinas",
+            "en tu balcón sus nidos a colgar,",
+            "y otra vez con el ala a sus cristales",
+            "jugando llamarán.",
+            "",
+            "Pero aquellas que el vuelo refrenaban",
+            "tu hermosura y mi dicha a contemplar,",
+            "aquellas que aprendieron nuestros nombres...",
+            "ésas... ¡no volverán!",
+            "",
+            "Volverán las tupidas madreselvas",
+            "de tu jardín las tapias a escalar,",
+            "y otra vez a la tarde aún más hermosas",
+            "sus flores se abrirán.",
+        ),
+    ),
+    (
+        "Proverbios y cantares XXIX",
+        "Antonio Machado",
+        (
+            "Caminante, son tus huellas",
+            "el camino y nada más;",
+            "caminante, no hay camino,",
+            "se hace camino al andar.",
+            "Al andar se hace el camino,",
+            "y al volver la vista atrás",
+            "se ve la senda que nunca",
+            "se ha de volver a pisar.",
+            "Caminante no hay camino",
+            "sino estelas en la mar.",
+        ),
+    ),
+    (
+        "La plaza tiene una torre",
+        "Antonio Machado",
+        (
+            "La plaza tiene una torre,",
+            "la torre tiene un balcón,",
+            "el balcón tiene una dama,",
+            "la dama una blanca flor.",
+            "Ha pasado un caballero",
+            "—¡quién sabe por qué pasó!—",
+            "y se ha llevado la plaza,",
+            "con su torre y su balcón,",
+            "con su balcón y su dama,",
+            "su dama y su blanca flor.",
+        ),
+    ),
+    (
+        "Pegasos, lindos pegasos",
+        "Antonio Machado",
+        (
+            "Pegasos, lindos pegasos,",
+            "caballitos de madera.",
+            "Yo conocí siendo niño",
+            "la alegría de dar vueltas",
+            "sobre un corcel colorado",
+            "en una noche de fiesta.",
+            "En el aire polvoriento",
+            "chispeaban las candelas,",
+            "y la noche azul ardía",
+            "toda sembrada de estrellas.",
+            "¡Alegrías infantiles",
+            "que cuestan una moneda de cobre,",
+            "lindos pegasos,",
+            "caballitos de madera!",
+        ),
+    ),
+    (
+        "Canción del pirata (fragmento)",
+        "José de Espronceda",
+        (
+            "Con diez cañones por banda,",
+            "viento en popa a toda vela,",
+            "no corta el mar, sino vuela",
+            "un velero bergantín;",
+            "bajel pirata que llaman,",
+            "por su bravura, el Temido,",
+            "en todo mar conocido",
+            "del uno al otro confín.",
+            "",
+            "La luna en el mar riela,",
+            "en la lona gime el viento,",
+            "y alza en blando movimiento",
+            "olas de plata y azul;",
+            "y va el capitán pirata,",
+            "cantando alegre en la popa,",
+            "Asia a un lado, al otro Europa,",
+            "y allá a su frente Estambul.",
+        ),
+    ),
+    (
+        "Un soneto me manda hacer Violante",
+        "Lope de Vega",
+        (
+            "Un soneto me manda hacer Violante,",
+            "que en mi vida me he visto en tanto aprieto;",
+            "catorce versos dicen que es soneto;",
+            "burla burlando van los tres delante.",
+            "Yo pensé que no hallara consonante",
+            "y estoy a la mitad de otro cuarteto;",
+            "mas si me veo en el primer terceto,",
+            "no hay cosa en los cuartetos que me espante.",
+            "Por el primer terceto voy entrando,",
+            "y aún parece que entré con pie derecho,",
+            "pues fin con este verso le voy dando.",
+            "Ya estoy en el segundo, y aún sospecho",
+            "que voy los trece versos acabando;",
+            "contad si son catorce, y está hecho.",
+        ),
+    ),
+    (
+        "Hombres necios que acusáis",
+        "Sor Juana Inés de la Cruz",
+        (
+            "Hombres necios que acusáis",
+            "a la mujer sin razón,",
+            "sin ver que sois la ocasión",
+            "de lo mismo que culpáis;",
+            "",
+            "si con ansia sin igual",
+            "solicitáis su desdén,",
+            "¿por qué queréis que obren bien",
+            "si las incitáis al mal?",
+        ),
+    ),
+    (
+        "Amor constante más allá de la muerte",
+        "Francisco de Quevedo",
+        (
+            "Cerrar podrá mis ojos la postrera",
+            "sombra que me llevare el blanco día,",
+            "y podrá desatar esta alma mía",
+            "hora a su afán ansioso lisonjera;",
+            "mas no, de esotra parte, en la ribera,",
+            "dejará la memoria, en donde ardía:",
+            "nadar sabe mi llama la agua fría,",
+            "y perder el respeto a ley severa.",
+            "Alma a quien todo un dios prisión ha sido,",
+            "venas que humor a tanto fuego han dado,",
+            "médulas que han gloriosamente ardido,",
+            "su cuerpo dejará, no su cuidado;",
+            "serán ceniza, mas tendrá sentido;",
+            "polvo serán, mas polvo enamorado.",
+        ),
+    ),
+    (
+        "Versos sencillos I",
+        "José Martí",
+        (
+            "Yo soy un hombre sincero",
+            "de donde crece la palma,",
+            "y antes de morirme quiero",
+            "echar mis versos del alma.",
+            "",
+            "Yo vengo de todas partes,",
+            "y hacia todas partes voy:",
+            "arte soy entre las artes,",
+            "en los montes, monte soy.",
+            "",
+            "Yo sé los nombres extraños",
+            "de las yerbas y las flores,",
+            "y de mortales engaños,",
+            "y de sublimes dolores.",
+        ),
+    ),
+    (
+        "Sonatina (fragmento)",
+        "Rubén Darío",
+        (
+            "La princesa está triste... ¿Qué tendrá la princesa?",
+            "Los suspiros se escapan de su boca de fresa,",
+            "que ha perdido la risa, que ha perdido el color.",
+            "La princesa está pálida en su silla de oro,",
+            "está mudo el teclado de su clave sonoro;",
+            "y en un vaso, olvidada, se desmaya una flor.",
+        ),
+    ),
+    (
+        "Romance sonámbulo (fragmento)",
+        "Federico García Lorca",
+        (
+            "Verde que te quiero verde.",
+            "Verde viento. Verdes ramas.",
+            "El barco sobre la mar",
+            "y el caballo en la montaña.",
+            "",
+            "Con la sombra en la cintura",
+            "ella sueña en su baranda,",
+            "verde carne, pelo verde,",
+            "con ojos de fría plata.",
+        ),
+    ),
+]
+
+
+def _poem_fold(text: str) -> str:
+    return text.lower().translate(
+        str.maketrans("áéíóúüàèìòùñç", "aeiouuaeiounc")
     )
+
+
+def poem_report(author: str | None) -> str:
+    if author:
+        wanted = _poem_fold(author).strip()
+        candidates = [
+            poem
+            for poem in POEMAS
+            if wanted in _poem_fold(poem[1]) or wanted in _poem_fold(poem[0])
+        ]
+        if not candidates:
+            autores = sorted({poem[1] for poem in POEMAS})
+            raise CommandError(
+                f"No tengo poemas de «{author}».\n"
+                f"Prueba con: {', '.join(autores)}."
+            )
+    else:
+        candidates = list(POEMAS)
+    title, poet, lines = random.choice(candidates)
+    return f"📜 {title}\n✍️ {poet}\n\n" + "\n".join(lines) + "\n\n📚 poemas en español"
 
 
 async def cmd_poema(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     author = " ".join(context.args).strip() if context.args else None
-    await update.effective_message.reply_text(truncate(await poem_report(author)))
+    await update.effective_message.reply_text(truncate(poem_report(author)))
 
 
 async def advice_report() -> str:
